@@ -1,0 +1,453 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HiLib - 抖音聊天适配</title>
+  <link rel="stylesheet" href="/styles/app.css" />
+</head>
+<body>
+  <!-- 全局加载遮罩（Vue 挂载前显示，挂载后移除） -->
+  <div id="app-loading" class="app-loading">
+    <div class="app-loading-spinner"></div>
+    <span class="app-loading-text">加载中...</span>
+  </div>
+
+  <div id="app" v-cloak>
+    <!-- 左侧导航栏 -->
+    <aside class="sidebar">
+      <div class="sidebar-top">
+        <button class="nav-item active" title="消息" @click="nav='messages'">
+          <svg viewBox="0 0 24 24" class="icon"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg>
+          <span class="nav-label">消息</span>
+          <span v-if="totalUnread > 0" class="nav-badge">{{ totalUnread > 99 ? '99+' : totalUnread }}</span>
+        </button>
+        <button class="nav-item" disabled title="首页（待开发）">
+          <svg viewBox="0 0 24 24" class="icon"><path d="M10 20v-6h4v6h5v-8h3L12 3 2 12h3v8z"/></svg>
+          <span class="nav-label">首页</span>
+        </button>
+        <button class="nav-item" disabled title="推荐（待开发）">
+          <svg viewBox="0 0 24 24" class="icon"><path d="M12 2l2.4 7.4H22l-6.2 4.6 2.4 7.4-6.2-4.6L5.8 21.4l2.4-7.4L2 9.4h7.6z"/></svg>
+          <span class="nav-label">推荐</span>
+        </button>
+      </div>
+      <div class="sidebar-bottom">
+        <button class="nav-item settings-btn" :title="myProfile?.nickname || '设置'" @click="showAccountMenu = !showAccountMenu">
+          <img v-if="myProfile && myProfile.avatarUrl" :src="myProfile.avatarUrl" class="nav-avatar" alt="avatar" @error="myProfile.avatarUrl = null">
+          <svg v-else viewBox="0 0 24 24" class="icon"><path d="M19.14 12.94c.04-.3.06-.61.06-.94 0-.32-.02-.64-.07-.94l2.03-1.58c.18-.14.23-.41.12-.61l-1.92-3.32c-.12-.22-.37-.29-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54c-.04-.24-.24-.41-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96c-.22-.08-.47 0-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.05.3-.09.63-.09.94s.02.64.07.94l-2.03 1.58c-.18.14-.23.41-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.57 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+          <span class="nav-label">{{ myProfile?.nickname || '设置' }}</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- 账号菜单弹层 -->
+    <div v-if="showAccountMenu" class="account-menu-overlay" @click.self="showAccountMenu = false">
+      <div class="account-menu">
+        <!-- 顶部：当前用户信息 -->
+        <div class="account-menu-hero">
+          <img v-if="myProfile && myProfile.avatarUrl" :src="myProfile.avatarUrl" class="hero-avatar" alt="avatar" @error="myProfile.avatarUrl = null">
+          <div v-else class="hero-avatar placeholder">{{ (myProfile?.nickname || '我')[0].toUpperCase() }}</div>
+          <div class="hero-info">
+            <div class="hero-name">{{ myProfile?.nickname || '未登录' }}</div>
+            <div v-if="myProfile && myProfile.uniqueId" class="hero-id">抖音号：{{ myProfile.uniqueId }}</div>
+          </div>
+          <button class="icon-btn" @click="showAccountMenu = false">×</button>
+        </div>
+
+        <!-- 中间：账号列表（不含当前账号） -->
+        <div class="account-menu-body">
+          <div v-if="accounts.filter(a => a.name !== currentAccount).length === 0" class="empty-hint">
+            没有其他账号
+          </div>
+          <div v-for="a in accounts.filter(a => a.name !== currentAccount)" :key="a.name" class="account-row">
+            <div class="account-avatar sm">{{ a.name[0].toUpperCase() }}</div>
+            <div class="account-info">
+              <div class="account-name">{{ a.name }}</div>
+              <div class="account-meta">
+                {{ a.hasSessionid ? '已登录' : '无 sessionid' }}
+                · {{ formatTime(a.savedAt) }}
+              </div>
+            </div>
+            <button class="text-btn" @click="switchAccount(a.name)">切换</button>
+            <button class="text-btn danger" @click="deleteAccount(a.name)">删除</button>
+          </div>
+        </div>
+
+        <!-- 底部操作 -->
+        <div class="account-menu-footer">
+          <button class="btn" @click="scanBrowser" :disabled="scanDialog.loading">
+            {{ scanDialog.loading ? '扫描中...' : '扫描浏览器' }}
+          </button>
+          <button class="btn primary" @click="openLoginDialog('qr')">扫码登录</button>
+          <button class="btn" @click="openLoginDialog('cookie')">导入 Cookie</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 扫描结果弹窗 -->
+    <div v-if="scanDialog.show" class="login-dialog-overlay" @click.self="closeScanDialog">
+      <div class="login-dialog">
+        <div class="login-dialog-header">
+          <span>扫描结果</span>
+          <button class="icon-btn" @click="closeScanDialog">×</button>
+        </div>
+        <div class="login-dialog-body">
+          <div v-if="scanDialog.loading" class="loading-box">
+            <div class="spinner"></div>
+            <span>正在扫描 Chrome / Edge 已登录的抖音账号...</span>
+          </div>
+          <div v-else-if="scanDialog.error" class="error-box">{{ scanDialog.error }}</div>
+          <div v-else-if="scanDialog.accounts.length === 0" class="empty-hint">
+            未扫描到已登录的抖音账号
+          </div>
+          <div v-else class="scan-list">
+            <div v-for="(a, i) in scanDialog.accounts" :key="i" class="scan-row" :class="{ selected: scanDialog.selected.includes(i) }" @click="toggleScanSelect(i)">
+              <div class="scan-checkbox" :class="{ checked: scanDialog.selected.includes(i) }">
+                <svg v-if="scanDialog.selected.includes(i)" viewBox="0 0 24 24" class="icon small"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>
+              </div>
+              <div class="scan-info">
+                <div class="scan-uid">UID: {{ a.uid || '(未知)' }}</div>
+                <div class="scan-meta">{{ a.browser }} · {{ a.profile }}</div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="login-dialog-footer" v-if="!scanDialog.loading && scanDialog.accounts.length > 0">
+          <button class="btn" @click="closeScanDialog">取消</button>
+          <button class="btn primary" :disabled="scanDialog.selected.length === 0" @click="doImportScanned">
+            导入 {{ scanDialog.selected.length }} 个账号
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 登录弹窗 -->
+    <div v-if="loginDialog.mode" class="login-dialog-overlay" @click.self="closeLoginDialog">
+      <div class="login-dialog">
+        <div class="login-dialog-header">
+          <span>{{ loginDialog.mode === 'qr' ? '扫码登录' : '导入 Cookie' }}</span>
+          <button class="icon-btn" @click="closeLoginDialog">×</button>
+        </div>
+        <div class="login-dialog-body">
+          <template v-if="loginDialog.mode === 'qr'">
+            <div class="form-hint">
+              点击"开始登录"后，服务器会启动浏览器并打开抖音聊天页。<br/>
+              请在弹出的浏览器中扫码登录，登录成功后自动保存（账号名自动用 uid 命名）。
+            </div>
+            <div class="form-row">
+              <label>超时（秒）</label>
+              <input v-model.number="loginDialog.timeout" type="number" min="60" max="1800" />
+            </div>
+            <div v-if="loginDialog.status === 'loading'" class="loading-box">
+              <div class="spinner"></div>
+              <span>浏览器已启动，等待扫码登录...</span>
+            </div>
+            <div v-if="loginDialog.status === 'success'" class="success-box">登录成功！账号: {{ loginDialog.name }}</div>
+            <div v-if="loginDialog.status === 'error'" class="error-box">{{ loginDialog.error }}</div>
+          </template>
+          <template v-else>
+            <div class="form-row">
+              <label>账号名（可选，留空自动用 uid 命名）</label>
+              <input v-model="loginDialog.name" type="text" placeholder="留空则自动提取 uid_tt" />
+            </div>
+            <div class="form-row">
+              <label>Cookie 字符串</label>
+              <textarea v-model="loginDialog.cookie" rows="6" placeholder='从浏览器 F12 复制，格式: "k1=v1; k2=v2; ..."'></textarea>
+            </div>
+            <div class="form-hint">
+              需包含 sessionid 字段。打开 douyin.com → F12 → Application → Cookies → 复制全部。
+            </div>
+          </template>
+        </div>
+        <div class="login-dialog-footer">
+          <button class="btn" @click="closeLoginDialog">取消</button>
+          <button v-if="loginDialog.mode === 'qr'" class="btn primary" :disabled="loginDialog.status === 'loading'" @click="doQrLogin">开始登录</button>
+          <button v-else class="btn primary" :disabled="!loginDialog.cookie" @click="doCookieLogin">保存</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 中间会话列表 -->
+    <section class="conv-panel">
+      <div class="conv-header">
+        <h2 class="panel-title">消息</h2>
+        <button class="icon-btn" :class="{ loading: loadingContacts }" @click="loadContacts" title="刷新">
+          <svg viewBox="0 0 24 24" class="icon"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+        </button>
+      </div>
+      <div class="conv-search">
+        <input v-model="searchKeyword" type="text" placeholder="搜索昵称或 UID" />
+      </div>
+      <div class="conv-list">
+        <div v-if="loadingContacts && contacts.length === 0" class="empty-state">
+          <div class="spinner"></div>
+          <span>加载会话列表...</span>
+        </div>
+        <div v-else-if="contactsError" class="empty-state error">
+          <span>{{ contactsError }}</span>
+          <button class="btn" @click="loadContacts">重试</button>
+        </div>
+        <div v-else-if="filteredContacts.length === 0" class="empty-state">
+          <span>{{ contacts.length === 0 ? '暂无会话' : '无匹配结果' }}</span>
+        </div>
+        <TransitionGroup v-else name="conv-list" tag="div">
+          <div
+            v-for="c in filteredContacts"
+            :key="c.conversationId"
+            class="conv-item"
+            :class="{ active: selectedCid === c.conversationId }"
+            @click="selectContact(c)"
+          >
+            <div class="conv-avatar">
+              <img v-if="c.avatarUrl" :src="c.avatarUrl" class="conv-avatar-img" alt="" />
+              <span v-else>{{ (c.nickname || '?')[0].toUpperCase() }}</span>
+            </div>
+            <div class="conv-main">
+              <div class="conv-top-row">
+                <span class="conv-name">{{ c.nickname || '(未知)' }}</span>
+                <span class="conv-time">{{ c.lastMessageTs ? formatShortTime(c.lastMessageTs) : '' }}</span>
+              </div>
+              <div class="conv-bottom-row">
+                <span class="conv-preview">{{ c.lastMessage || '点击查看消息' }}</span>
+                <span v-if="c.unreadCount && c.unreadCount > 0" class="conv-unread">{{ c.unreadCount > 99 ? '99+' : c.unreadCount }}</span>
+              </div>
+            </div>
+          </div>
+        </TransitionGroup>
+      </div>
+    </section>
+
+    <!-- 右侧聊天窗口 -->
+    <section class="chat-panel">
+      <template v-if="selectedContact">
+        <div class="chat-header">
+          <div class="chat-peer">
+            <div class="conv-avatar">
+              <img v-if="selectedContact.avatarUrl" :src="selectedContact.avatarUrl" class="conv-avatar-img" alt="" />
+              <span v-else>{{ (selectedContact.nickname || '?')[0].toUpperCase() }}</span>
+            </div>
+            <div>
+              <div class="chat-peer-name">{{ selectedContact.nickname || '(未知)' }}</div>
+              <div class="chat-peer-meta">
+                <template v-if="selectedContact.douyinId">抖音号: {{ selectedContact.douyinId }}</template>
+                <template v-else>UID: {{ selectedContact.uid || '-' }}</template>
+              </div>
+            </div>
+          </div>
+          <button class="icon-btn" :class="{ loading: loadingMessages }" @click="reloadMessages" title="刷新">
+            <svg viewBox="0 0 24 24" class="icon"><path d="M17.65 6.35A7.958 7.958 0 0012 4c-4.42 0-7.99 3.58-7.99 8s3.57 8 7.99 8c3.73 0 6.84-2.55 7.73-6h-2.08A5.99 5.99 0 0112 18c-3.31 0-6-2.69-6-6s2.69-6 6-6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>
+          </button>
+        </div>
+        <div class="msg-list" ref="msgListRef" @scroll="onMessagesScroll">
+          <div v-if="loadingMoreMessages" class="load-more-hint">
+            <div class="spinner small"></div>
+            <span>加载更多消息...</span>
+          </div>
+          <div v-if="loadingMessages && messages.length === 0" class="empty-state">
+            <div class="spinner"></div>
+            <span>加载消息...</span>
+          </div>
+          <div v-else-if="messagesError" class="empty-state error">
+            <span>{{ messagesError }}</span>
+            <button class="btn" @click="reloadMessages">重试</button>
+          </div>
+          <div v-else-if="messages.length === 0" class="empty-state">
+            <span>暂无消息</span>
+          </div>
+          <template v-else>
+            <div v-for="(m, i) in messages" :key="m.msgId || i">
+              <div v-if="shouldShowTimeDivider(i)" class="time-divider">
+                <span>{{ formatFullTime(m.timestamp) }}</span>
+              </div>
+              <div class="msg-row" :class="msgRowClass(m)">
+                <div class="msg-avatar" :class="msgAvatarClass(m)">
+                  <img
+                    v-if="m.isSelf && !m.isFromRobot && m.category !== 'system_tip' && m.category !== 'recall' && myProfile && myProfile.avatarUrl"
+                    :src="myProfile.avatarUrl"
+                    class="msg-avatar-img"
+                    alt=""
+                  />
+                  <img
+                    v-else-if="!m.isSelf && !m.isFromRobot && m.category !== 'system_tip' && m.category !== 'recall' && selectedContact && selectedContact.avatarUrl"
+                    :src="selectedContact.avatarUrl"
+                    class="msg-avatar-img"
+                    alt=""
+                  />
+                  <span v-else>{{ msgAvatarText(m) }}</span>
+                </div>
+                <div class="msg-bubble" :class="msgBubbleClass(m)">
+                  <template v-if="m.isEncryptedImage">
+                    <img
+                      v-if="selectedContact && selectedContact.conversationShortId && (m.serverMsgId || m.msgId)"
+                      :src="`/api/images/decrypt?msgId=${encodeURIComponent(m.serverMsgId || m.msgId)}&cid=${encodeURIComponent(selectedCid)}&shortId=${encodeURIComponent(selectedContact.conversationShortId)}`"
+                      class="msg-image"
+                      loading="lazy"
+                      @click="previewImage(`/api/images/decrypt?msgId=${encodeURIComponent(m.serverMsgId || m.msgId)}&cid=${encodeURIComponent(selectedCid)}&shortId=${encodeURIComponent(selectedContact.conversationShortId)}`)"
+                      @error="$event.target.style.display='none'; $event.target.nextElementSibling.style.display=''"
+                    />
+                    <span class="msg-text" style="display:none">[图片已失效]</span>
+                  </template>
+                  <template v-else-if="m.category === 'image' || m.category === 'sticker'">
+                    <img
+                      v-if="m.stickerUrl && m.imageSkey"
+                      :src="`/api/images/get?msgId=${encodeURIComponent(m.msgId)}&cid=${encodeURIComponent(selectedCid)}`"
+                      class="msg-image"
+                      loading="lazy"
+                      @click="previewImage(`/api/images/get?msgId=${encodeURIComponent(m.msgId)}&cid=${encodeURIComponent(selectedCid)}`)"
+                      @error="loadImageWithFullParams($event, m, selectedCid)"
+                    />
+                    <img
+                      v-else-if="m.imageOid && m.imageSkey"
+                      :src="`/api/images/get?msgId=${encodeURIComponent(m.msgId)}&cid=${encodeURIComponent(selectedCid)}`"
+                      class="msg-image"
+                      loading="lazy"
+                      @click="previewImage(`/api/images/get?msgId=${encodeURIComponent(m.msgId)}&cid=${encodeURIComponent(selectedCid)}`)"
+                      @error="loadImageWithFullParams($event, m, selectedCid)"
+                    />
+                    <img
+                      v-else-if="m.stickerUrl"
+                      :src="`/api/images/proxy?url=${encodeURIComponent(m.stickerUrl)}`"
+                      class="msg-image"
+                      loading="lazy"
+                      @click="previewImage(`/api/images/proxy?url=${encodeURIComponent(m.stickerUrl)}`)"
+                    />
+                    <span v-else class="msg-text" v-html="renderEmoji(m.text || '[图片]')"></span>
+                    <span v-if="(m.stickerUrl || m.imageOid) && m.imageSkey" class="msg-text" style="display:none">[图片加载失败]</span>
+                  </template>
+                  <template v-else-if="m.category === 'video_share'">
+                    <a v-if="m.videoUrl" :href="m.videoUrl" target="_blank" rel="noopener" class="msg-video-card clickable">
+                      <div v-if="m.videoAuthor" class="msg-video-author">{{ m.videoAuthor }}</div>
+                      <div class="msg-video-title">{{ m.text || '(无标题)' }}</div>
+                      <div class="msg-video-hint">点击查看视频</div>
+                    </a>
+                    <div v-else class="msg-video-card">
+                      <div v-if="m.videoAuthor" class="msg-video-author">{{ m.videoAuthor }}</div>
+                      <div class="msg-video-title">{{ m.text || '(无标题)' }}</div>
+                    </div>
+                  </template>
+                  <template v-else>
+                    <span class="msg-text" v-html="renderEmoji(m.text || '(空消息)')"></span>
+                  </template>
+                  <div class="msg-meta">
+                    <span v-if="m.isRecalled" class="msg-tag tag-image">图片</span>
+                    <span v-if="m.isRecalled" class="msg-tag tag-recall">撤回</span>
+                    <span v-if="!m.isRecalled" class="msg-tag" :class="msgTagClass(m)">{{ msgTagText(m) }}</span>
+                    <span v-if="m.timestamp" class="msg-time">{{ formatMsgTime(m.timestamp) }}</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="chat-footer">
+          <!-- 输入行（在最上方，面板往下展开） -->
+          <div class="chat-input-row">
+            <button
+              class="icon-btn"
+              :class="{ active: plusMenuOpen }"
+              @click="plusMenuOpen = !plusMenuOpen; emojiPanelOpen = false"
+              title="更多功能"
+            >
+              <svg viewBox="0 0 24 24" class="icon"><path d="M19 13h-6v6h-2v-6H5v-2h6V5h2v6h6v2z"/></svg>
+            </button>
+            <button
+              class="icon-btn"
+              :class="{ active: emojiPanelOpen }"
+              @click="toggleEmojiPanel"
+              title="表情"
+            >
+              <svg viewBox="0 0 24 24" class="icon"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z"/></svg>
+            </button>
+            <div
+              ref="messageInputRef"
+              class="chat-input-editor"
+              contenteditable="true"
+              data-placeholder="输入消息..."
+              @input="onDraftInput"
+              @keydown.enter.prevent="doSendMessage"
+              @paste="onPaste"
+              @drop.prevent="onDrop"
+              @dragover.prevent
+            ></div>
+            <button class="btn primary" :disabled="!draftText.trim() || sending" @click="doSendMessage">
+              {{ sending ? '发送中...' : '发送' }}
+            </button>
+          </div>
+
+          <!-- 表情面板（往下展开） -->
+          <div v-if="emojiPanelOpen" class="emoji-panel">
+            <div class="emoji-panel-header">
+              <span>表情</span>
+              <button class="emoji-panel-close" @click="emojiPanelOpen = false">×</button>
+            </div>
+            <div class="emoji-grid">
+              <div
+                v-for="(url, name) in emojiMap"
+                :key="name"
+                class="emoji-item"
+                @click="insertEmoji(name)"
+                :title="name"
+              >
+                <img :src="url" :alt="name" loading="lazy" />
+              </div>
+              <div v-if="Object.keys(emojiMap).length === 0" class="emoji-empty">
+                暂无表情，请往 IRSC/douyin/ 目录添加表情图片
+              </div>
+            </div>
+          </div>
+
+          <!-- 加号展开菜单（往下展开） -->
+          <div v-if="plusMenuOpen" class="plus-menu">
+            <div class="plus-item" @click="pickImage">
+              <svg viewBox="0 0 24 24" class="icon"><path d="M21 19V5c0-1.1-.9-2-2-2H5c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h14c1.1 0 2-.9 2-2zM8.5 13.5l2.5 3.01L14.5 12l4.5 6H5l3.5-4.5z"/></svg>
+              <span>本地图片</span>
+            </div>
+            <div class="plus-item" @click="openEmojiFromPlus">
+              <svg viewBox="0 0 24 24" class="icon"><path d="M11.99 2C6.47 2 2 6.48 2 12s4.47 10 9.99 10C17.52 22 22 17.52 22 12S17.52 2 11.99 2zM12 20c-4.42 0-8-3.58-8-8s3.58-8 8-8 8 3.58 8 8-3.58 8-8 8zm3.5-9c.83 0 1.5-.67 1.5-1.5S16.33 8 15.5 8 14 8.67 14 9.5s.67 1.5 1.5 1.5zm-7 0c.83 0 1.5-.67 1.5-1.5S9.33 8 8.5 8 7 8.67 7 9.5 7.67 11 8.5 11zm3.5 6.5c2.33 0 4.31-1.46 5.11-3.5H6.89c.8 2.04 2.78 3.5 5.11 3.5z"/></svg>
+              <span>表情包</span>
+            </div>
+            <div class="plus-item" @click="pickFile">
+              <svg viewBox="0 0 24 24" class="icon"><path d="M14 2H6c-1.1 0-1.99.9-1.99 2L4 20c0 1.1.89 2 1.99 2H18c1.1 0 2-.9 2-2V8l-6-6zm2 16H8v-2h8v2zm0-4H8v-2h8v2zm-3-5V3.5L18.5 9H13z"/></svg>
+              <span>文件</span>
+            </div>
+          </div>
+
+          <!-- 待发送图片预览条 -->
+          <div v-if="pendingImages.length > 0" class="image-preview-strip">
+            <div v-for="(img, i) in pendingImages" :key="i" class="preview-item">
+              <img :src="img.dataUrl" :alt="img.name" />
+              <button class="preview-remove" @click="removePendingImage(i)" title="移除">×</button>
+            </div>
+            <button
+              class="btn primary preview-send-btn"
+              :disabled="sending"
+              @click="doSendImages"
+            >{{ sending ? '发送中...' : '发送图片' }}</button>
+          </div>
+
+          <!-- 隐藏的文件选择器 -->
+          <input ref="imageInputRef" type="file" accept="image/*" multiple style="display:none" @change="onImageSelected" />
+          <input ref="fileInputRef" type="file" style="display:none" @change="onFilePicked" />
+        </div>
+      </template>
+      <div v-else class="empty-state full">
+        <div class="empty-illustration">
+          <svg viewBox="0 0 24 24" class="icon large"><path d="M20 2H4c-1.1 0-2 .9-2 2v18l4-4h14c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm0 14H6l-2 2V4h16v12z"/></svg>
+        </div>
+        <span>选择左侧会话开始聊天</span>
+      </div>
+    </section>
+
+    <!-- 图片预览 -->
+    <div v-if="previewImageUrl" class="image-preview-overlay" @click="previewImageUrl = null">
+      <img :src="previewImageUrl" class="image-preview" />
+    </div>
+
+    <!-- 全局 toast -->
+    <div v-if="toast.text" class="toast" :class="toast.type">{{ toast.text }}</div>
+  </div>
+
+  <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+  <script src="/scripts/app.js"></script>
+</body>
+</html>

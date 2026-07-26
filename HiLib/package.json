@@ -1,0 +1,26 @@
+{
+  "name": "hilib",
+  "version": "0.1.0",
+  "description": "抖音聊天适配 Web 界面（基于 SPRR 逆向 API）",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/server.ts",
+    "start": "tsx src/server.ts",
+    "capture": "tsx scripts/capture.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.5.0",
+    "express": "^4.21.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.0.0",
+    "playwright": "^1.48.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
