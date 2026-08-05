@@ -1,0 +1,8 @@
+{
+  "_comment": "全局深度思考配置文件。优先级：请求体 reasoning > persona.reasoning > perUser[uid] > defaultReasoning。",
+  "_values": "off / low / medium / high",
+  "defaultReasoning": "medium",
+  "perUser": {
+    "7670234185550415409": "medium"
+  }
+}

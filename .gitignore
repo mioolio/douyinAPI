@@ -1,0 +1,57 @@
+# ============================
+# 排除整个子项目（不推送到本仓库）
+# ============================
+airi-main/
+HiLib/
+
+# ============================
+# 敏感数据：个人数据 / API Key / Cookie / 账号
+# ============================
+
+# ai-server 配置文件（含 DeepSeek API Key）
+ai-server/config.json
+
+# ai-server 用户对话数据（按日期存档、session、注入的上下文）
+ai-server/data/
+
+# ai-server 训练数据（含真人聊天记录分析）
+ai-server/training/training.json
+
+# ai-server 临时 cookie 文件
+ai-server/1
+
+# SPRR 所有运行时数据（账号、cookie、白名单、回复记录、浏览器配置、ticket-guard）
+SPRR/data/
+
+# ============================
+# 日志和临时文件
+# ============================
+*.log
+creator.douyin.com-*.log
+新建 文本文档.txt
+tmp-cookie-state.json
+
+# ============================
+# 依赖和构建产物
+# ============================
+node_modules/
+dist/
+*.tsbuildinfo
+
+# ============================
+# 编辑器和系统文件
+# ============================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# ============================
+# 环境变量文件
+# ============================
+.env
+.env.local
+.env.*.local
