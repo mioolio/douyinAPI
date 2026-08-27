@@ -47,6 +47,7 @@ import {
   readMessage,
 } from '../crypto/protobuf.js';
 import type { QuoteReplyRef } from '../api/operations.js';
+import { getBrowserSender, closeBrowserSender } from './browser-pool.js';
 
 const log = createLogger('browser-send');
 
@@ -583,9 +584,10 @@ export class BrowserSender {
 }
 
 /**
- * 一次性浏览器发送（用于 send 命令）
+ * 浏览器发送（用于 send 命令）
  *
- * 启动浏览器 → 发送消息 → 关闭浏览器
+ * 通过单例池复用浏览器实例：首次调用启动浏览器（~5s 预热），
+ * 后续调用直接复用（~0.5s），避免每条消息都重新启动/关闭浏览器。
  *
  * @param storageStatePath storageState 文件路径
  * @param env 请求环境
@@ -602,24 +604,23 @@ export async function sendViaBrowser(
   sign: BrowserSendSign,
   headless = true,
 ): Promise<BrowserSendResult> {
-  const sender = new BrowserSender(storageStatePath, headless);
   try {
-    await sender.launch();
+    const sender = await getBrowserSender(storageStatePath, headless);
     return await sender.send(env, conversationId, text, sign);
   } catch (e) {
+    // 浏览器实例可能已损坏，关闭以便下次重新启动
+    await closeBrowserSender();
     return {
       success: false,
       reason: `browser-send 异常: ${e instanceof Error ? e.message : String(e)}`,
     };
-  } finally {
-    await sender.close();
   }
 }
 
 /**
- * 一次性浏览器引用回复（用于 reply 命令）
+ * 浏览器引用回复（用于 reply 命令）
  *
- * 启动浏览器 → 发送引用回复 → 关闭浏览器
+ * 同样通过单例池复用浏览器实例。
  */
 export async function sendQuoteReplyViaBrowser(
   storageStatePath: string,
@@ -630,16 +631,14 @@ export async function sendQuoteReplyViaBrowser(
   sign: BrowserSendSign,
   headless = true,
 ): Promise<BrowserSendResult> {
-  const sender = new BrowserSender(storageStatePath, headless);
   try {
-    await sender.launch();
+    const sender = await getBrowserSender(storageStatePath, headless);
     return await sender.sendQuoteReply(env, conversationId, text, ref, sign);
   } catch (e) {
+    await closeBrowserSender();
     return {
       success: false,
       reason: `browser-send 异常: ${e instanceof Error ? e.message : String(e)}`,
     };
-  } finally {
-    await sender.close();
   }
 }

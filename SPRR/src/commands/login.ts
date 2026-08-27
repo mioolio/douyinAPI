@@ -68,7 +68,7 @@ export async function loginAccount(
     try {
       oldStateObj = JSON.parse(await fs.readFile(accountFile(name), 'utf-8'));
       initialSessionids = new Set(
-        (oldStateObj.cookies || [])
+        (oldStateObj?.cookies || [])
           .filter((c) => c.name === 'sessionid' || c.name === 'sessionid_ss')
           .map((c) => c.value),
       );
@@ -93,7 +93,7 @@ export async function loginAccount(
         await saveAccountStorageState(name, stateToSave);
         await setCurrentAccount(name);
         const cookieCount = stateToSave.cookies?.length || 0;
-        const uid = stateToSave.cookies?.find((c) => c.name === 'uid_tt')?.value;
+        const uid = stateToSave.cookies?.find((c: { name: string; value: string }) => c.name === 'uid_tt')?.value;
         log.info(
           `登录完成：账号 ${name}，共 ${cookieCount} 个 cookie，uid_tt=${uid || '?'}`,
         );
@@ -302,44 +302,90 @@ async function verifySessionidValid(
  * 通过实际调用 IM API 验证 sessionid 是否真正有效
  *
  * 发送 cmd=2006 (GET_USER_CONVERSATION_LIST) 请求，limit=1 只拉一条，
- * status=0 表示 sessionid 有效，其他状态码（如 "unexepcted session length"）表示失效。
+ * status=0 表示 sessionid 有效。
+ *
+ * 重要：区分「服务器临时错误」和「sessionid 真正失效」：
+ *   - status=500 / desc=StatusCodeRemoteOrNetError → 抖音服务器抖动/风控/网络错误，
+ *     并不代表 sessionid 失效，需要重试（共 3 次请求，间隔 1 秒）。
+ *   - 其他非 0 状态（如 "unexepcted session length"）→ 真正的鉴权失败，不重试。
+ *   - 重试耗尽仍为 500 → 按失效处理，弹出浏览器让用户自行判断（浏览器内若已登录可直接关闭）。
  *
  * @param cookieStr cookie 字符串
  * @returns true=sessionid 有效
  */
 async function verifyViaImapi(cookieStr: string): Promise<boolean> {
-  try {
-    const env: RequestEnv = { cookie: cookieStr };
-    // 构造最小请求：cmd=2006, limit=1，只拉一条会话
-    const subBody = Buffer.concat([
-      encodeVarintField(1, 2), // sort_type=2
-      encodeVarintField(2, 0), // cursor=0
-      encodeVarintField(3, 1), // con_type=1 私聊
-      encodeVarintField(4, 1), // limit=1
-      encodeVarintField(5, 0),
-      encodeVarintField(6, 0),
-    ]);
-    const body = encodeBytesField(2006, subBody);
-    const reqBuf = buildRequest({
-      cmd: IMAPI_CONSTANTS.IMCMD.GET_USER_CONVERSATION_LIST,
-      sequenceId: 99001, // 验证专用序号，不与正常请求冲突
-      inboxType: 0,
-      body,
-      env,
-    });
+  const maxAttempts = 3; // 1 次初始 + 2 次重试
+  const retryDelayMs = 1000;
 
-    const resp = await sendImapi({
-      path: '/v1/conversation/list',
-      body: reqBuf,
-      cookie: cookieStr,
-    });
+  const env: RequestEnv = { cookie: cookieStr };
+  // 构造最小请求：cmd=2006, limit=1，只拉一条会话
+  const subBody = Buffer.concat([
+    encodeVarintField(1, 2), // sort_type=2
+    encodeVarintField(2, 0), // cursor=0
+    encodeVarintField(3, 1), // con_type=1 私聊
+    encodeVarintField(4, 1), // limit=1
+    encodeVarintField(5, 0),
+    encodeVarintField(6, 0),
+  ]);
+  const body = encodeBytesField(2006, subBody);
+  const reqBuf = buildRequest({
+    cmd: IMAPI_CONSTANTS.IMCMD.GET_USER_CONVERSATION_LIST,
+    sequenceId: 99001, // 验证专用序号，不与正常请求冲突
+    inboxType: 0,
+    body,
+    env,
+  });
 
-    log.debug(`[验证] IM API: status=${resp.statusCode} desc=${resp.errorDesc} body=${resp.body.length}B`);
-    return resp.statusCode === 0;
-  } catch (e) {
-    log.debug(`[验证] IM API 调用异常: ${e}`);
-    return false;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const resp = await sendImapi({
+        path: '/v1/conversation/list',
+        body: reqBuf,
+        cookie: cookieStr,
+      });
+
+      log.debug(
+        `[验证] IM API (第${attempt}/${maxAttempts}次): status=${resp.statusCode} desc=${resp.errorDesc} body=${resp.body.length}B`,
+      );
+
+      // status=0 → sessionid 有效
+      if (resp.statusCode === 0) {
+        return true;
+      }
+
+      // 服务器临时错误（500 / StatusCodeRemoteOrNetError）→ 重试
+      // 这类错误不是 sessionid 失效，而是抖音服务器抖动/风控/网络问题
+      const isServerError =
+        resp.statusCode === 500 || resp.errorDesc === 'StatusCodeRemoteOrNetError';
+      if (isServerError && attempt < maxAttempts) {
+        log.warn(
+          `[验证] IM API 服务器临时错误（status=${resp.statusCode} ${resp.errorDesc}），${retryDelayMs}ms 后重试...`,
+        );
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+        continue;
+      }
+
+      // 重试耗尽仍为服务器错误，或返回其他鉴权失败状态 → 视为失效
+      if (isServerError) {
+        log.warn(
+          `[验证] IM API 服务器临时错误，已重试 ${maxAttempts - 1} 次仍失败，按失效处理（将弹出浏览器供用户判断）`,
+        );
+      } else {
+        log.debug(
+          `[验证] IM API 鉴权失败（status=${resp.statusCode} ${resp.errorDesc}），sessionid 已失效`,
+        );
+      }
+      return false;
+    } catch (e) {
+      log.debug(`[验证] IM API 调用异常 (第${attempt}/${maxAttempts}次): ${e}`);
+      if (attempt < maxAttempts) {
+        await new Promise((r) => setTimeout(r, retryDelayMs));
+        continue;
+      }
+      return false;
+    }
   }
+  return false;
 }
 
 /** 仅列出当前所有账号（CLI 的 accounts 命令用） */

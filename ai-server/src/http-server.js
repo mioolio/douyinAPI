@@ -15,6 +15,7 @@ const { loadPersona, savePersona } = require('./persona');
 const { loadSession, sessionFile, sessionCache } = require('./session');
 const { chatWithUser } = require('./chat');
 const { injectContext, clearInjectedContext, getInjectedContextStats } = require('./context');
+const { checkSilent, addSchedule, clearSchedule, getScheduleList } = require('./schedule');
 
 // ============================ HTTP 工具 ============================
 
@@ -85,6 +86,8 @@ function createServer() {
           persona: 'GET/PUT /persona/:uid',
           whitelist: 'GET/POST/DELETE /whitelist',
           reset: 'POST /reset/:uid',
+          schedule: 'GET/POST/DELETE /schedule/:uid',
+          scheduleStatus: 'GET /schedule-status',
         },
       });
     }
@@ -212,6 +215,49 @@ function createServer() {
     // ---------- 注入上下文状态 ----------
     if (pathname === '/context-status' && method === 'GET') {
       return sendJSON(res, 200, { injected: getInjectedContextStats() });
+    }
+
+    // ---------- 免打扰计划任务管理 ----------
+    // GET /schedule/:uid        获取用户的 schedule 列表
+    // POST /schedule/:uid       手动添加 schedule { start, end, reason }
+    // DELETE /schedule/:uid     清除用户的所有 schedule
+    const scheduleMatch = pathname.match(/^\/schedule\/([^\/]+)$/);
+    if (scheduleMatch) {
+      const uid = decodeURIComponent(scheduleMatch[1]);
+      if (method === 'GET') {
+        return sendJSON(res, 200, { uid, schedules: getScheduleList(uid) });
+      }
+      if (method === 'POST') {
+        let body = {};
+        try { body = JSON.parse(await readBody(req) || '{}'); } catch (e) { return sendJSON(res, 400, { error: 'JSON 解析失败' }); }
+        const start = String(body.start || '').trim();
+        const end = String(body.end || '').trim();
+        const reason = String(body.reason || '').trim();
+        if (!start || !end) return sendJSON(res, 400, { error: '缺少 start 或 end' });
+        addSchedule(uid, start, end, reason);
+        log(`[计划任务] 手动添加 uid=${uid} ${start} ~ ${end}（${reason}）`);
+        return sendJSON(res, 200, { ok: true, uid, schedules: getScheduleList(uid) });
+      }
+      if (method === 'DELETE') {
+        clearSchedule(uid);
+        log(`[计划任务] 已清除 uid=${uid} 的所有免打扰`);
+        return sendJSON(res, 200, { ok: true, uid, message: '免打扰计划已清除' });
+      }
+    }
+
+    // ---------- 免打扰状态查询 ----------
+    // GET /schedule-status     查询所有用户的免打扰状态
+    if (pathname === '/schedule-status' && method === 'GET') {
+      const { whitelist } = require('./config');
+      const result = [];
+      for (const uid of whitelist) {
+        const { silent } = checkSilent(uid);
+        const schedules = getScheduleList(uid);
+        if (schedules.length > 0) {
+          result.push({ uid, silent, schedules });
+        }
+      }
+      return sendJSON(res, 200, { schedules: result });
     }
 
     // ---------- 重置会话 ----------

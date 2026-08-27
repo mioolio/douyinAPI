@@ -25,9 +25,22 @@ const { saveTurn } = require('./archive');
 const { callDeepSeek } = require('./deepseek');
 const { buildTrainingSection } = require('./training');
 const { getInjectedContextMessages } = require('./context');
+const { checkSilent, addSchedule, parseTime } = require('./schedule');
 
 async function chatWithUser(uid, userMsg, opts) {
   opts = opts || {};
+
+  // 免打扰检查：如果用户在 schedule 时间段内，直接返回 <fail>，不调用 AI
+  const silentCheck = checkSilent(uid);
+  if (silentCheck.silent) {
+    const s = silentCheck.schedule;
+    log(`[免打扰] uid=${uid} 静音中（${s.start} ~ ${s.end}，原因：${s.reason}），跳过回复`);
+    // 仍然记录用户消息到 session（保持上下文连续），但不记录 AI 回复
+    const session = loadSession(uid);
+    appendMessage(uid, 'user', userMsg);
+    return '<fail>';
+  }
+
   const persona = loadPersona(uid);
   const session = loadSession(uid);
 
@@ -106,10 +119,34 @@ async function chatWithUser(uid, userMsg, opts) {
     process.stdout.write('\n--- AI 思考过程结束 ---\n');
   }
   // 兼容老调用方：callDeepSeek 现在返回 { text, reasoning }
-  const aiText = typeof result === 'string' ? result : (result.text || '');
+  const aiTextRaw = typeof result === 'string' ? result : (result.text || '');
   const aiReasoning = (typeof result === 'object' && result.reasoning) ? result.reasoning : '';
 
+  // 解析 <schedule> 标记：AI 生成的免打扰计划任务
+  // 格式：<schedule start="YYYY-MM-DD HH:mm" end="YYYY-MM-DD HH:mm" reason="...">确认消息
+  // 解析后存储到 schedule.json，从回复文本中移除标记，只保留确认消息
+  let aiText = aiTextRaw;
+  const scheduleMatch = aiTextRaw.match(/<schedule\s+start="([^"]+)"\s+end="([^"]+)"\s+reason="([^"]*)">/);
+  if (scheduleMatch) {
+    const [, start, end, reason] = scheduleMatch;
+    // 验证时间格式
+    const startTs = parseTime(start);
+    const endTs = parseTime(end);
+    if (startTs && endTs && endTs > startTs) {
+      addSchedule(uid, start, end, reason);
+      log(`[计划任务] uid=${uid} 已添加免打扰：${start} ~ ${end}（${reason}）`);
+      // 从回复中移除 schedule 标记，保留剩余的确认消息
+      aiText = aiTextRaw.replace(scheduleMatch[0], '').trim();
+      // 如果移除标记后为空，说明 AI 只输出了标记没有确认消息 → 不发送
+      if (!aiText) aiText = '<fail>';
+    } else {
+      log(`[计划任务] uid=${uid} 时间格式无效，忽略：start=${start} end=${end}`);
+      aiText = aiTextRaw.replace(scheduleMatch[0], '').trim() || '<fail>';
+    }
+  }
+
   // 写入会话历史 (先存用户消息，再存 AI 回复)
+  // 注意：存入 session 的是处理后的干净文本（不含 schedule 标记）
   appendMessage(uid, 'user', userMsg);
   appendMessage(uid, 'assistant', aiText);
 

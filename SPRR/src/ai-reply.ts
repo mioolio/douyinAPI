@@ -619,6 +619,11 @@ export async function processUnreadMessages(
         log.warn(`[离线回复] AI 未返回内容，跳过发送`);
         continue;
       }
+      // 检测 <fail> 标记：AI 主动跳过回复（用户不想被打扰时 AI 输出 <fail>）
+      if (reply.trim() === '<fail>') {
+        log.info(`[离线回复] ${contact.nickname}(${uid}): AI 选择跳过回复（<fail>）`);
+        continue;
+      }
 
       const sign: SendSignContext = {
         conversationShortId: contact.conversationShortId,
@@ -903,6 +908,11 @@ async function doHandleIncomingMessageViaHistory(
     const reply = await askAI(peerUid, target.text, target.serverMsgId);
     if (!reply) {
       log.warn(`[AI回复] AI 未返回内容，跳过发送`);
+      return;
+    }
+    // 检测 <fail> 标记：AI 主动跳过回复（用户不想被打扰时 AI 输出 <fail>）
+    if (reply.trim() === '<fail>') {
+      log.info(`[AI回复] ${nickname}(${peerUid}): AI 选择跳过回复（<fail>）`);
       return;
     }
 
