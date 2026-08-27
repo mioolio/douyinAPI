@@ -50,6 +50,16 @@
   - [comments - 评论列表](#comments---评论列表)
   - [comment - 发布评论/回复](#comment---发布评论回复)
   - [ticket-guard - 管理浏览器加密签名头](#ticket-guard---管理浏览器加密签名头)
+- [抓包与调试](#抓包与调试)
+  - [debug-capture 抓包脚本](#debug-capture-抓包脚本)
+  - [使用流程](#使用流程)
+  - [输出目录与汇总格式](#输出目录与汇总格式)
+  - [2026 年 8 月 API 变化记录](#2026-年-8-月-api-变化记录)
+- [贡献指南](#贡献指南)
+  - [贡献类型](#贡献类型)
+  - [代码认领方向](#代码认领方向)
+  - [贡献流程](#贡献流程)
+  - [代码规范](#代码规范)
 - [常见问题](#常见问题)
 
 ---
@@ -846,6 +856,189 @@ sprr ticket-guard --show
 
 ---
 
+## 抓包与调试
+
+当接口变更导致功能失效时，可通过抓包工具采集最新协议数据，辅助逆向分析。
+
+### debug-capture 抓包脚本
+
+`SPRR/scripts/debug-capture.ts` 基于 Playwright 实现，可完整捕获浏览器侧的 HTTP 请求与 WebSocket 帧，并在终止时输出结构化汇总报告，用于识别新增 cmd 编号、接口路径、请求参数、签名头变化等。
+
+启动方式：
+
+```bash
+cd SPRR
+npx tsx scripts/debug-capture.ts
+```
+
+脚本依赖：Playwright 与 Chromium。若首次运行提示缺少浏览器，请执行 `npx playwright install chromium`。
+
+### 使用流程
+
+1. 脚本启动 Chromium（默认显示界面，便于手动操作）并自动导航到 `https://www.douyin.com/`
+2. 在浏览器中完成目标操作：扫码登录、发送消息、接收仅读一次、发表评论、查看通知等
+3. 完成操作后，在运行脚本的终端按下 `Ctrl+C` 终止抓包进程
+4. 脚本将在终端打印汇总报告，并将完整数据写入本地目录
+
+汇总报告包含以下内容：
+- 本次抓取的 HTTP 请求总数、WebSocket 连接数与帧数
+- 按 cmd 编号分组的请求列表（含 URL、方法、请求体大小、响应状态码）
+- 未知 cmd 编号提醒（标记为「未知 cmd」，是新增 API 的重要线索）
+- 签名参数汇总（query 参数中出现的 a_bogus、msToken 等）
+- 请求头汇总（特别是 `bd-ticket-guard-*` 系列与 `x-tt-session-dtrait`）
+
+### 输出目录与汇总格式
+
+每次抓包生成独立的输出目录：
+
+```
+SPRR/data/capture/debug/debug-YYYYMMDD-HHMMSS/
+├── requests/        # 单请求 JSON，包含完整 headers、query、body、response body
+├── frames/          # WebSocket 原始帧数据与方向标注
+└── summary.json     # 汇总报告（结构化 JSON，便于程序读取）
+```
+
+`summary.json` 核心字段：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| capturedAt | string | ISO 时间戳 |
+| httpRequests | array | 全部 HTTP 请求摘要（cmd、url、headers、query、响应片段） |
+| websocketFrames | array | WS 帧（方向、cmd、payload、protobuf 原始字节） |
+| unknownCmds | array<number> | 本次发现的未在已知列表中的 cmd 编号 |
+| signatureParams | object | 统计签名参数与出现频次 |
+| signatureHeaders | object | 统计签名头与出现频次 |
+
+### 2026 年 8 月 API 变化记录
+
+以下通过 `debug-capture.ts` 采集获得，供逆向分析参考。
+
+**消息推送架构变更：**
+- 疑似由 Frontier WebSocket 长连接迁移至 HTTP 短轮询机制
+- 新增接口：`cmd=2048`，路径 `/v1/message/get_user_message`
+- 新增未分析 cmd 编号：`2043`、`2010`，需进一步解析 payload 结构
+
+**仅读一次消息协议：**
+- 消息类型：`msgType=104`, `aweType=10400`
+- 扩展字段：`ext: s:once_view_count = "1"`
+- 其他字段结构与普通文本消息一致，仅扩展标识不同
+
+**签名方法更新：**
+- 签名参数（query/body）：`device_platform`, `msToken`, `a_bogus`, `verifyFp`, `fp`
+- 新增签名头（请求头）：
+  - `bd-ticket-guard-client-data`
+  - `bd-ticket-guard-ree-public-key`
+  - `bd-ticket-guard-version`
+  - `bd-ticket-guard-web-sign-type`
+  - `bd-ticket-guard-web-version`
+  - `x-tt-session-dtrait`
+
+如发现新的 cmd、字段或签名变化，欢迎按「贡献指南」中的方式分享。
+
+---
+
+## 贡献指南
+
+项目的持续演进依赖社区参与，欢迎以多种形式贡献。以下为完整的贡献类型、认领方向、流程与规范。
+
+### 贡献类型
+
+**1. Bug 报告**
+
+通过 Issue 提交问题，请提供以下信息以提高定位效率：
+- 执行的具体命令与预期行为
+- 实际输出内容，推荐附带 `--verbose --json` 组合下的完整日志
+- 抖音 Web 端是否存在可观察到的对应变化（界面改版、功能下线、风控提示等）
+- 若为接口失败，附 `notices --count 5` 命令的输出以确认 cookie 是否仍然有效
+
+**2. API 逆向发现分享**
+
+观察到 API 变更时，欢迎分享分析成果：
+- 使用 `scripts/debug-capture.ts` 完成抓包后，将 `summary.json` 中的关键信息整理至 Issue
+- 新增 cmd 编号、接口路径、字段语义、payload 结构变化等
+- 签名机制变化：新增参数、新增请求头、签名算法变更迹象
+- 若能提供对应的 protobuf 字段编号与类型映射，尤为珍贵
+
+**3. 代码 Pull Request**
+
+可认领以下方向，亦可自选合理主题。提交前请确保 `tsc --noEmit`（SPRR 目录）与 `node --check`（ai-server 目录）通过。
+
+**4. 文档改进**
+
+- 修正文档中的错误或过时说明
+- 补充缺失的参数描述、示例、注意事项
+- 文档多语言翻译
+- 补充使用教程、集成示例、最佳实践
+
+### 代码认领方向
+
+| 难度 | 方向 | 说明 |
+| --- | --- | --- |
+| 入门 | 新命令实现 | 参考 `src/commands/` 下已有实现，按 CLI 框架扩展所需命令 |
+| 入门 | 类型补全 | 完善 `src/types/index.ts` 中仍标注为 `unknown` 的字段 |
+| 入门 | 消息类型解析 | 在 `history` 输出中补充目前标记为「未知」的消息类型 |
+| 进阶 | cmd 2043/2048/2010 解析 | 完成新增 cmd 的响应结构映射，并对接现有调用链 |
+| 进阶 | 轮询 watch 适配 | 将 watch 命令由 WebSocket 架构迁移至 HTTP 轮询新接口 |
+| 进阶 | 仅读一次消息发送 | 在 `send` 中新增 `--once` 选项，写入对应的 msgType 与 ext |
+| 进阶 | 资料/通知新字段解析 | 随着资料与通知接口更新，补充新字段的语义映射 |
+| 高阶 | secsdk 三头纯算研究 | ticket-guard 三头生成机制的纯算可行性研究与实现 |
+| 高阶 | 风控策略研究 | 高频请求下的风控触发阈值、触发条件、应对方案沉淀 |
+| 高阶 | ProtoBuf 完整 Schema | 持续完善 protobuf 字段映射，输出稳定的 .proto 定义 |
+
+### 贡献流程
+
+1. Fork 本仓库至个人账号
+2. Clone 至本地：
+   ```bash
+   git clone https://github.com/<username>/douyinAPI.git
+   cd douyinAPI
+   ```
+3. 创建功能分支（命名建议 `feature/<topic>` 或 `fix/<topic>`）：
+   ```bash
+   git checkout -b feature/cmd-2048-parser
+   ```
+4. 本地完成开发与自测，提交变更：
+   ```bash
+   git add -A
+   git commit -m "<type>(<scope>): <description>"
+   ```
+5. 推送分支至个人 Fork：
+   ```bash
+   git push -u origin feature/cmd-2048-parser
+   ```
+6. 通过 GitHub 提交 Pull Request，在 PR 描述中说明：改动目的、相关 Issue（如有）、验证方式、是否存在破坏性变更，等待审核与合并。
+
+### 代码规范
+
+- TypeScript 代码需符合 `SPRR/tsconfig.json` 编译配置；提交前通过 `tsc --noEmit`
+- ai-server 的 JavaScript 代码通过 `node --check` 语法校验
+- 新增命令需同步更新本文件的对应章节与示例
+- 提交信息推荐采用 Conventional Commits 格式：`type(scope): description`
+
+  常用 type 取值：
+  | type | 适用场景 |
+  | --- | --- |
+  | feat | 新增功能、新命令、新解析能力 |
+  | fix | 修复已有功能的 bug、修复风控兼容性 |
+  | docs | 文档变更（README、clu.md、注释） |
+  | refactor | 代码重构，不改变外部行为 |
+  | perf | 性能优化（启动耗时、请求合并、节流策略） |
+  | chore | 构建配置、依赖升级、脚本调整 |
+  | test | 测试用例新增或调整 |
+
+  示例：
+  ```
+  feat(message): 新增仅读一次消息发送选项
+  fix(comment): 调整 ticket-guard 三头加载优先级
+  docs(clu): 补充抓包工具使用说明
+  refactor(commands): 账号命令抽取为 account-cmds 模块
+  ```
+
+- 保持变更粒度最小化：单次 Pull Request 聚焦单一主题，避免混合重构、功能、依赖升级
+- 新增逆向分析脚本放在 `SPRR/scripts/` 目录，文件名使用 `_` 前缀标明为一次性分析工具，或使用稳定命名标明可复用（如 `debug-capture.ts`）
+
+---
+
 ## 常见问题
 
 ### 1. Cookie 过期
@@ -1135,3 +1328,38 @@ npx tsx src/indexv2.ts
   --text "感谢提及" \
   --reply-id 7400000000000000000
 ```
+
+### 场景 7：抓包分析 API 变更
+
+当抖音接口更新导致现有功能异常或出现未知 cmd 时，按以下流程采集数据：
+
+```bash
+# 1. 进入 SPRR 目录，启动 debug-capture
+cd SPRR
+npx tsx scripts/debug-capture.ts
+# 脚本启动 Chromium，自动打开 douyin.com
+
+# 2. 在浏览器中执行目标操作（约 2-5 分钟）：
+#    - 扫码登录（若未登录）
+#    - 发送普通文本、图片、表情
+#    - 发送或接收仅读一次消息
+#    - 进入通知页、查看通知详情
+#    - 打开任意视频、发布或回复一条评论
+
+# 3. 操作完成后，回到终端按下 Ctrl+C 终止
+# 脚本输出汇总报告，示例如下：
+#   ══════════════════════════════════════════════════
+#   ║ 抓包完成，数据已保存到: .../debug-YYYYMMDD-HHMMSS
+#   ║ HTTP 请求: 72 个
+#   ║ WS 连接: 0 个
+#   ║ ★ 发现未知 cmd: 2043, 2048, 2010
+#   ╚═════════════════════════════════════════════════
+
+# 4. 打开 summary.json，提取以下信息并提交 Issue：
+#    - unknownCmds 中的新增 cmd 编号
+#    - httpRequests 中对应 cmd 的完整 URL（去掉敏感 cookie）
+#    - signatureParams 与 signatureHeaders 两项的完整内容
+#    - 若涉及新消息类型，附上对应消息的 request/response body 片段
+```
+
+将抓包目录下的 `summary.json` 与关键请求 JSON 打包后，可通过 Issue 附带的形式分享，用于共同逆向分析。
