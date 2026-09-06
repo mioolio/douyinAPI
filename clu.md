@@ -453,28 +453,28 @@ AI 自动回复采用**双服务架构**：
 ```
 ┌─────────────────┐         ┌─────────────────┐         ┌──────────────┐
 │   SPRR (CLI)    │ ──HTTP──│  ai-server      │ ──HTTPS─│   DeepSeek   │
-│                 │  /chat  │  (本地 7860)    │         │   云端 API   │
-│ - WebSocket 监听│         │                 │         └──────────────┘
+│                 │  /chat  │  (本地 7861)    │         │   云端 API   │
+│ - HTTP 轮询监听 │         │                 │         └──────────────┘
 │ - 白名单管理     │         │ - 会话历史存档  │
 │ - 消息发送       │         │ - 人设管理      │
 │                 │        │ - 流式调用 LLM  │
 └─────────────────┘         └─────────────────┘
 ```
 
-- **SPRR**：负责监听消息推送、白名单管理、消息发送
+- **SPRR**：负责轮询监听新消息、白名单管理、消息发送
 - **ai-server**：独立服务，负责管理会话历史、人设、调用 DeepSeek
 - **白名单**：存储在 SPRR 本地（`data/ai-whitelist.json`），管理白名单无需启动 ai-server
 
 ### 消息处理流程
 
-1. WebSocket 推送收到新消息 → SPRR 收到通知
-2. 调用 `getHistory` 拉取权威消息列表（不依赖 WS 推送的方向字段，避免被混淆）
+1. cmd2048 轮询收到新消息 → SPRR 收到通知（监听器为 `src/commands/poll-watch.ts`）
+2. 调用 `getHistory` 拉取权威消息列表（不依赖轮询事件的方向字段，避免被混淆）
 3. 找到最新的、对方发送的、未处理的文本消息（按 `serverMsgId` 去重，允许相同文本）
 4. 调用 ai-server `/chat` 接口，ai-server 拼接人设 + 历史上下文调 DeepSeek
 5. 收到 AI 回复后，SPRR 发送消息给对方
-6. AI 回复的推送回来时，history 显示 `isSelf=true`，自动跳过，避免循环回复
+6. AI 回复的轮询事件回来时，history 显示 `isSelf=true`，自动跳过，避免循环回复
 
-**节流机制（防风控）：** 同一会话 5 秒内多次推送合并为一次 history 查询，避免频繁调用触发抖音风控。
+**节流机制（防风控）：** 同一会话 5 秒内多次触发合并为一次 history 查询，避免频繁调用触发抖音风控。
 
 ---
 
@@ -512,7 +512,7 @@ sprr ai [--add <uid>] [--del <uid>] [--list] [--refresh]
 
 ### `watch --ai` - 开启自动回复
 
-启动 WebSocket 监听并开启 AI 自动回复：
+启动轮询监控并开启 AI 自动回复：
 
 ```
 ◆ sprr> watch --ai
@@ -521,8 +521,8 @@ sprr ai [--add <uid>] [--del <uid>] [--list] [--refresh]
 **启动后会显示：**
 - 当前账号 UID
 - 白名单加载结果（用户数量 + UID 列表）
-- WebSocket 连接状态
-- 实时消息推送日志
+- 同步游标就绪与轮询状态（间隔默认 3000ms）
+- 实时消息日志
 
 **消息日志格式：**
 
@@ -608,26 +608,45 @@ cd ai-server
 node server.js
 ```
 
-**配置文件** `ai-server/config.json`：
+**配置文件** `ai-server/config.json`（与实际结构一致，key 换成自己的）：
 
 ```json
 {
-  "port": 7860,
-  "deepseekApiKey": "sk-xxx",
-  "deepseekModel": "deepseek-chat",
-  "deepseekBaseUrl": "https://api.deepseek.com"
+  "port": 7861,
+  "bindHost": "0.0.0.0",
+  "deepseek": {
+    "baseURL": "https://api.deepseek.com/v1",
+    "apiKey": "sk-xxx",
+    "model": "deepseek-chat",
+    "reasoningModel": "deepseek-reasoner",
+    "temperature": 0.85,
+    "maxTokens": 1024,
+    "timeoutMs": 60000
+  },
+  "whitelist": ["<uid>"],
+  "defaultPersona": "personas/default.json",
+  "maxHistoryMessages": 30
 }
 ```
 
 **会话存档：**
-- 会话历史：`ai-server/data/sessions/<uid>.json`（每用户独立，含完整上下文）
-- 单轮存档：`ai-server/data/turns/<uid>/<timestamp>.json`（每轮对话独立存档）
+- 会话历史：`ai-server/data/users/<uid>/session.json`（每用户独立，含完整上下文）
+- 单轮存档：`ai-server/data/users/<uid>/<YYYYMMDD>.json`（按日存档，含 reasoning 原文）
+- 注入上下文：`ai-server/data/users/<uid>/context.json`（`/context` 命令写入）
 
-**API 接口：**
+**API 接口（完整实现见 `ai-server/src/http-server.js`）：**
 
 | 接口 | 方法 | 说明 |
 |------|------|------|
-| `POST /chat` | POST | 对话接口，参数：`uid`、`message`、`stream`（可选） |
+| `/chat` | POST | 对话接口，参数：`uid`、`message`、`stream`（可选）、`reasoning`（思考深度） |
+| `/inject-context` | POST | 注入历史上下文（`/context` 命令调用） |
+| `/clear-context/:uid` | POST | 清除指定用户的注入上下文 |
+| `/context-status` | GET | 查看上下文注入状态 |
+| `/history/:uid` | GET | 拉取指定用户会话历史 |
+| `/whitelist` | GET / POST / DELETE | 白名单查看与增删 |
+| `/persona/:uid` | GET / PUT | 人设读取与修改 |
+| `/schedule/:uid`、`/schedule-status` | GET / POST | 免打扰计划任务管理 |
+| `/reset/:uid` | POST | 重置指定用户会话 |
 
 > 白名单管理已迁移到 SPRR 本地，ai-server 不再处理白名单校验，SPRR 端完全控制哪些用户触发 AI 回复。
 
@@ -1170,7 +1189,7 @@ npm install playwright
 # 1. 确认 ai-server 已启动（在另一个终端）
 cd ai-server
 node server.js
-# 应看到: ai-server listening on http://127.0.0.1:7860
+# 应看到: ai-server listening on http://127.0.0.1:7861
 
 # 2. 确认白名单已正确加载
 ◆ sprr> ai --list
