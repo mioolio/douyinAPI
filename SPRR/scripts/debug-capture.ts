@@ -65,7 +65,10 @@ const CMD_NAMES: Record<number, string> = {
   2001: 'GET_MIN_INDEX',
   2002: 'MARK_CONVERSATION_READ',
   2006: 'GET_USER_CONVERSATION_LIST',
+  2010: 'CLIENT_ACK',
   2038: 'BATCH_GET_READINDEX',
+  2043: 'GET_MESSAGE_BY_INIT',
+  2048: 'GET_USER_MESSAGE',
 };
 
 /** 默认抓包时长上限（分钟），用户关闭浏览器即提前结束 */

@@ -22,8 +22,8 @@
 
 | 项目 | 状态 | 说明 |
 | --- | --- | --- |
-| 消息推送架构 | 变更中 | 疑似由 WebSocket 迁移至 HTTP 轮询，新增 `cmd=2048` 接口 `/v1/message/get_user_message` |
-| 未知 cmd 编号 | 待分析 | 新增 `2043`、`2048`、`2010`，需进一步解析 payload 结构 |
+| 消息推送架构 | 已适配 | 已由 WebSocket 迁移至 HTTP 轮询，新增 `cmd=2048` 接口 `/v1/message/get_user_message`，`watch` 默认轮询模式 |
+| 新增 cmd 编号 | 部分解析 | `2043`（init 同步）、`2048`（轮询）已解析并接入；`2010`（client ack）结构已知、未强依赖 |
 | 仅读一次消息 | 已识别 | `msgType=104`, `aweType=10400`, 扩展字段 `s:once_view_count = "1"` |
 | 签名参数 | 已识别 | `device_platform`, `msToken`, `a_bogus`, `verifyFp`, `fp` |
 | 新增签名头 | 已识别 | `bd-ticket-guard-*` 系列 + `x-tt-session-dtrait` |
@@ -40,7 +40,7 @@
 - 天然兼容浏览器侧新增的签名机制（secsdk / ticket-guard）
 
 代码重构进行中，后续将逐步恢复以下能力：
-- 实时消息监控（watch）的 HTTP 轮询适配
+- ~~实时消息监控（watch）的 HTTP 轮询适配~~（已完成：`watch` 默认轮询模式，无需浏览器）
 - 直播间自动评论
 - 已读/未读状态自定义
 - 其他自动化场景

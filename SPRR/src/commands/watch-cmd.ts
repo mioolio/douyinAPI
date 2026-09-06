@@ -1,6 +1,12 @@
 /**
  * watch + ai 命令（实时消息监控 / AI 自动回复）
  *
+ * 两种模式：
+ *   - 轮询（默认，2026-08 新协议）：cmd2043 init + cmd2048 HTTP 短轮询，
+ *     纯 Node 直连（imapi 接口仅需 Cookie），无需浏览器提取 access_key。
+ *   - WebSocket（--ws，旧版）：Frontier 长连接。2026-08 起官方客户端已不再
+ *     建立 WS 连接（抓包证实），仅作协议留档/回退用途。
+ *
  * 性能优化：watch --ai 复用 browser-pool 单例，不再单独创建/关闭浏览器。
  * 退出 watch 时仅解除 ai-reply 的引用（setBrowserSender(null)），
  * 不关闭浏览器实例，后续 send/reply 可继续复用。
@@ -22,6 +28,7 @@ import {
 import { connectFrontier, type FrontierFrame } from '../api/frontier.js';
 import { extractWsAccessKey } from './extract-ws-key.js';
 import { getBrowserSender } from './browser-pool.js';
+import { runPollingWatch } from './poll-watch.js';
 import {
   handleIncomingMessageViaHistory,
   refreshWhitelist,
@@ -74,13 +81,23 @@ export function registerWatchCommands(program: Command): void {
   /* --------------------------- watch --------------------------- */
   program
     .command('watch')
-    .description('实时监控新消息推送（Ctrl+C 返回 REPL）')
-    .option('--access-key <key>', '手动指定 access_key')
-    .option('--device-id <uid>', '设备ID')
+    .description('实时监控新消息（默认 HTTP 轮询；--ws 切换旧版 WebSocket）')
+    .option('--access-key <key>', '手动指定 access_key（仅 --ws 模式）')
+    .option('--device-id <uid>', '设备ID（仅 --ws 模式）')
     .option('--to <target>', '仅监控指定会话')
-    .option('--raw', '显示原始帧', false)
+    .option('--raw', '显示原始帧（仅 --ws 模式）', false)
+    .option('--ws', '使用旧版 WebSocket 推送模式（2026-08 前协议，留档/回退）', false)
+    .option('--interval <ms>', '轮询间隔毫秒（仅轮询模式，默认 3000）', '3000')
     .option('--ai', '开启 AI 自动回复（仅白名单内用户）', false)
-    .action(async (opts: { accessKey?: string; deviceId?: string; to?: string; raw: boolean; ai: boolean }) => {
+    .action(async (opts: {
+      accessKey?: string;
+      deviceId?: string;
+      to?: string;
+      raw: boolean;
+      ws: boolean;
+      interval: string;
+      ai: boolean;
+    }) => {
       await run(async ({ env, session }) => {
         const contacts = await getContacts(env);
         const aliases = await loadAliases();
@@ -107,6 +124,81 @@ export function registerWatchCommands(program: Command): void {
         for (const c of contacts) {
           cidToNickname.set(c.conversationId, c.nickname);
         }
+
+        /** AI 自动回复初始化（轮询/WS 两模式共用） */
+        const setupAi = async (): Promise<boolean> => {
+          log.info(`${C.brightMagenta}[watch]${C.reset} AI 自动回复已开启，正在加载本地白名单...`);
+          await refreshWhitelist();
+          log.info(`${C.brightMagenta}[watch]${C.reset} 仅白名单内用户会收到 AI 回复，其他消息只记录不回复`);
+          log.info(`${C.brightMagenta}[watch]${C.reset} 正在获取浏览器发送器（复用单例池）...`);
+          try {
+            const statePath = await getStatePathForBrowser();
+            const sender = await getBrowserSender(statePath, true);
+            setBrowserSender(sender);
+            return true;
+          } catch (e) {
+            log.warn(`[watch] 浏览器发送器获取失败，AI 回复将使用原生发送（可能失败）: ${e}`);
+            return false;
+          }
+        };
+
+        /** 启动时检查白名单用户的未读消息（处理离线期间错过的消息） */
+        const checkUnread = async (): Promise<void> => {
+          log.info(`${C.brightMagenta}[watch]${C.reset} 正在检查未读消息...`);
+          try {
+            const { loadReplyLog } = await import('./../auth/reply-log.js');
+            await loadReplyLog();
+            const unreadCount = await processUnreadMessages(myUid, contacts, env);
+            if (unreadCount > 0) {
+              log.info(`${C.brightMagenta}[watch]${C.reset} 未读检查完成，已回复 ${unreadCount} 条未读消息`);
+            } else {
+              log.info(`${C.brightMagenta}[watch]${C.reset} 未读检查完成，无未读消息需回复`);
+            }
+          } catch (e) {
+            log.warn(`[watch] 未读检查异常: ${e}`);
+          }
+        };
+
+        /* ─────────────────── 轮询模式（默认，2026-08 新协议） ─────────────────── */
+        if (!opts.ws) {
+          let usedPoolBrowser = false;
+          if (opts.ai) {
+            usedPoolBrowser = await setupAi();
+            await checkUnread();
+          }
+          console.log(divider());
+          await runPollingWatch({
+            env,
+            myUid,
+            intervalMs: Number(opts.interval) || 3000,
+            onMessage: (m) => {
+              if (targetCid && m.conversationId !== targetCid) return;
+              const nickname = cidToNickname.get(m.conversationId) || '(未知会话)';
+              const who = m.message.isSelf ? '我' : '对方';
+              log.info(
+                `${C.brightGreen}[新消息]${C.reset} ${nickname} | ${who}: ${m.message.text || '(非文本消息)'}`,
+              );
+              log.debug(
+                `[watch调试] msgType=${m.message.messageType} cid=${m.conversationId} sender=${m.message.senderId} isSelf=${m.message.isSelf}`,
+              );
+              // 自己/AI 发的消息不触发回复（ai-reply 内部也会按 history isSelf 兜底）
+              if (opts.ai && !m.message.isSelf && !m.message.isFromRobot) {
+                handleIncomingMessageViaHistory(m.conversationId, myUid, contacts, env).catch(
+                  (e) => {
+                    log.error(`[AI回复] 异常: ${e}`);
+                  },
+                );
+              }
+            },
+          });
+          // 循环结束（Ctrl+C），仅解除 ai-reply 引用，不关闭浏览器（留在单例池）
+          if (usedPoolBrowser) {
+            setBrowserSender(null);
+          }
+          return;
+        }
+
+        /* ─────────────────── 旧版 WebSocket 模式（--ws，留档/回退） ─────────────────── */
         let accessKey = opts.accessKey;
         let deviceId = opts.deviceId || myUid;
         if (!accessKey) {
@@ -126,33 +218,8 @@ export function registerWatchCommands(program: Command): void {
         log.info(`${C.cyan}[watch]${C.reset} 开始监听（Ctrl+C 返回 REPL）`);
         let usedPoolBrowser = false;
         if (opts.ai) {
-          log.info(`${C.brightMagenta}[watch]${C.reset} AI 自动回复已开启，正在加载本地白名单...`);
-          await refreshWhitelist();
-          log.info(`${C.brightMagenta}[watch]${C.reset} 仅白名单内用户会收到 AI 回复，其他消息只记录不回复`);
-          // 复用 browser-pool 单例（与 send/reply 共享，避免重复启动浏览器）
-          log.info(`${C.brightMagenta}[watch]${C.reset} 正在获取浏览器发送器（复用单例池）...`);
-          try {
-            const statePath = await getStatePathForBrowser();
-            const sender = await getBrowserSender(statePath, true);
-            setBrowserSender(sender);
-            usedPoolBrowser = true;
-          } catch (e) {
-            log.warn(`[watch] 浏览器发送器获取失败，AI 回复将使用原生发送（可能失败）: ${e}`);
-          }
-          // 启动时检查白名单用户的未读消息（处理离线期间错过的消息）
-          log.info(`${C.brightMagenta}[watch]${C.reset} 正在检查未读消息...`);
-          try {
-            const { loadReplyLog } = await import('./../auth/reply-log.js');
-            await loadReplyLog();
-            const unreadCount = await processUnreadMessages(myUid, contacts, env);
-            if (unreadCount > 0) {
-              log.info(`${C.brightMagenta}[watch]${C.reset} 未读检查完成，已回复 ${unreadCount} 条未读消息`);
-            } else {
-              log.info(`${C.brightMagenta}[watch]${C.reset} 未读检查完成，无未读消息需回复`);
-            }
-          } catch (e) {
-            log.warn(`[watch] 未读检查异常: ${e}`);
-          }
+          usedPoolBrowser = await setupAi();
+          await checkUnread();
         }
         console.log(divider());
 

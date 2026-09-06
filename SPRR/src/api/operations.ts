@@ -51,7 +51,7 @@ const log = createLogger('im-ops');
 
 /** 全局自增 sequence_id（从 10001 开始，与抓包样本一致） */
 let _seq = 10001;
-function nextSeq(): number {
+export function nextSeq(): number {
   return _seq++;
 }
 
@@ -997,8 +997,8 @@ function parseHistoryResponse(
   return parseHistoryResponseEx(resp, bodyType, expectedCid, myUid).messages;
 }
 
-/** 解析 MessageBody 为消息条目 */
-function parseMessageBody(
+/** 解析 MessageBody 为消息条目（cmd301 / cmd2048 轮询共用） */
+export function parseMessageBody(
   f: ProtobufField,
   expectedCid: string,
   myUid?: string,

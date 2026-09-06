@@ -393,21 +393,29 @@ sprr send-sticker -s <path> [--to <target>]
 
 ### `watch` - 实时监控推送
 
-通过 WebSocket 实时监控新消息推送（Ctrl+C 返回 REPL）。
+实时监控新消息（Ctrl+C 返回 REPL）。默认使用 **HTTP 轮询模式**（2026-08 新协议，纯 Node 直连，无需浏览器），`--ws` 切回旧版 WebSocket 模式。
 
 ```bash
-sprr watch [--access-key <key>] [--device-id <uid>] [--to <target>] [--raw] [--ai]
+sprr watch [--interval <ms>] [--to <target>] [--ws] [--access-key <key>] [--device-id <uid>] [--raw] [--ai]
 ```
 
 | 选项 | 必填 | 说明 |
 |------|------|------|
-| `--access-key` | 否 | 手动指定 access_key，不指定则自动从浏览器提取后关闭 |
-| `--device-id` | 否 | 设备 ID（即用户 UID），默认自动检测 |
+| `--interval` | 否 | 轮询间隔毫秒（仅轮询模式），默认 3000（官方客户端实测约 3~6 秒） |
 | `--to` | 否 | 仅监控指定会话，默认监控所有会话 |
-| `--raw` | 否 | 显示原始帧，便于调试 |
+| `--ws` | 否 | 使用旧版 Frontier WebSocket 推送（2026-08 前协议，官方已下线，留档/回退用） |
+| `--access-key` | 否 | 仅 `--ws` 模式：手动指定 access_key，不指定则自动从浏览器提取 |
+| `--device-id` | 否 | 仅 `--ws` 模式：设备 ID（即用户 UID），默认自动检测 |
+| `--raw` | 否 | 仅 `--ws` 模式：显示原始帧，便于调试 |
 | `--ai` | 否 | **开启 AI 自动回复**（仅白名单内用户会收到回复，详见 [AI 自动回复](#ai-自动回复)） |
 
-**工作原理：**
+**轮询模式工作原理（默认）：**
+1. `cmd=2043` 调用 `/v1/message/get_message_by_init` 初始化同步，取得初始游标（消息游标微秒时间戳 + 收件箱序号）
+2. `cmd=2048` 按间隔调用 `/v1/message/get_user_message` 轮询，解析新消息与会话事件（已读回执等），跟随服务端推进游标
+3. 连续失败 5 次自动重新 init 重建游标；按 `serverMsgId` 去重防止重复处理
+4. **无需 playwright / 无需浏览器**：imapi 接口仅需 Cookie（无 a_bogus/msToken 签名），纯 Node.js 直连
+
+**旧版 WS 模式工作原理（`--ws`）：**
 1. 通过 Playwright 启动无头浏览器，导航到 `douyin.com/chat`
 2. 拦截浏览器自身建立的 Frontier WebSocket 连接，提取 `access_key`
 3. 提取后关闭浏览器，Node.js 带 Cookie 直连 WebSocket
@@ -416,7 +424,7 @@ sprr watch [--access-key <key>] [--device-id <uid>] [--to <target>] [--raw] [--a
 **示例：**
 
 ```
-# 监控所有会话
+# 监控所有会话（默认轮询模式）
 ◆ sprr> watch
 
 # 监控并开启 AI 自动回复
@@ -425,14 +433,12 @@ sprr watch [--access-key <key>] [--device-id <uid>] [--to <target>] [--raw] [--a
 # 仅监控指定会话
 ◆ sprr> watch --to TwT
 
-# 手动指定 access_key
-◆ sprr> watch --access-key xxx --device-id 1196717705541576
+# 自定义轮询间隔（毫秒）
+◆ sprr> watch --interval 5000
 
-# 调试模式
-◆ sprr> watch --raw
+# 调试模式（仅 --ws）
+◆ sprr> watch --ws --raw
 ```
-
-> 注意：`watch` 需要 playwright（用于提取 access_key）。若报 `Cannot find package 'playwright'`，运行 `npm install playwright`。
 
 ---
 
@@ -914,9 +920,12 @@ SPRR/data/capture/debug/debug-YYYYMMDD-HHMMSS/
 以下通过 `debug-capture.ts` 采集获得，供逆向分析参考。
 
 **消息推送架构变更：**
-- 疑似由 Frontier WebSocket 长连接迁移至 HTTP 短轮询机制
-- 新增接口：`cmd=2048`，路径 `/v1/message/get_user_message`
-- 新增未分析 cmd 编号：`2043`、`2010`，需进一步解析 payload 结构
+- 由 Frontier WebSocket 长连接迁移至 HTTP 短轮询机制（抓包证实聊天页 0 个 WS 连接）
+- 新增接口：`cmd=2048`，路径 `/v1/message/get_user_message`（轮询取新消息/事件）
+- 新增接口：`cmd=2043`，路径 `/v1/message/get_message_by_init`（初始化同步，返回初始游标）
+- 新增接口：`cmd=2010`，路径 `/v1/client/ack`（客户端按 serverMsgId 确认消息）
+- **已适配**：`watch` 默认轮询模式（`src/api/polling.ts` + `src/commands/poll-watch.ts`），
+  请求/响应结构经 `scripts/_test-poll-encoder.ts` 与抓包样本逐字节校验
 
 **仅读一次消息协议：**
 - 消息类型：`msgType=104`, `aweType=10400`
@@ -977,8 +986,8 @@ SPRR/data/capture/debug/debug-YYYYMMDD-HHMMSS/
 | 入门 | 新命令实现 | 参考 `src/commands/` 下已有实现，按 CLI 框架扩展所需命令 |
 | 入门 | 类型补全 | 完善 `src/types/index.ts` 中仍标注为 `unknown` 的字段 |
 | 入门 | 消息类型解析 | 在 `history` 输出中补充目前标记为「未知」的消息类型 |
-| 进阶 | cmd 2043/2048/2010 解析 | 完成新增 cmd 的响应结构映射，并对接现有调用链 |
-| 进阶 | 轮询 watch 适配 | 将 watch 命令由 WebSocket 架构迁移至 HTTP 轮询新接口 |
+| 进阶 | cmd 2043/2048/2010 解析 | 2043/2048 已完成（见 `src/api/polling.ts`）；2010 ack 已知结构、按需接入 |
+| 进阶 | 轮询 watch 适配 | 已完成：`watch` 默认轮询模式（`poll-watch.ts`），可进一步打磨重连/异常体验 |
 | 进阶 | 仅读一次消息发送 | 在 `send` 中新增 `--once` 选项，写入对应的 msgType 与 ext |
 | 进阶 | 资料/通知新字段解析 | 随着资料与通知接口更新，补充新字段的语义映射 |
 | 高阶 | secsdk 三头纯算研究 | ticket-guard 三头生成机制的纯算可行性研究与实现 |
@@ -1139,7 +1148,7 @@ aweme_id 超过 JavaScript 的 `Number.MAX_SAFE_INTEGER`，处理时必须用字
 
 ### 7. playwright 缺失
 
-**症状：** `watch` 或 `login` 命令报 `Cannot find module 'playwright'` 或 `Cannot find package 'playwright'`。
+**症状：** `login`、`watch --ws` 或 `comment` 首次自动获取三头时报 `Cannot find module 'playwright'` 或 `Cannot find package 'playwright'`。
 
 **解决：**
 
@@ -1149,7 +1158,7 @@ cd SPRR
 npm install playwright
 ```
 
-> `watch` 命令需要 playwright 来提取 WebSocket 的 `access_key`（由 webmssdk.es5.js 的 frontierSign 函数生成，VM 字节码保护，无法在纯 Node.js 中复现）。
+> 默认轮询模式的 `watch` **不需要** playwright（纯 Node 直连 imapi 接口）。仅 `--ws` 旧版模式需要 playwright 来提取 WebSocket 的 `access_key`（由 webmssdk.es5.js 的 frontierSign 函数生成，VM 字节码保护，无法在纯 Node.js 中复现）。
 
 ### 8. AI 自动回复不触发
 
