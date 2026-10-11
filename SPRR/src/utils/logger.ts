@@ -25,13 +25,31 @@ const LEVEL_PRIORITY: Record<Level, number> = {
   error: 3,
 };
 
+let verbose = false;
+
+/** REPL 的 --verbose 对所有现有 logger 生效；显式环境级别仍优先。 */
+export function setLogVerbose(enabled: boolean): void {
+  verbose = enabled;
+}
+
+/** 浏览器诊断可能包含完整请求 URL，不能把认证参数写入终端。 */
+export function redactLogText(value: string): string {
+  return value.replace(
+    /(authorization\s*["']?\s*[:=]\s*["']?)(?:Bearer|Basic)\s+[^\s"'\},;]+/gi,
+    '$1[redacted]',
+  ).replace(
+    /((?:identity_security_token|msToken|a_bogus|sessionid(?:_ss)?|passport_csrf_token|access_key|bd-ticket-guard[\w-]*|x-tt-session-dtrait|authorization|token)\s*["']?\s*[:=]\s*["']?)[^&\s"'\},;]+/gi,
+    '$1[redacted]',
+  );
+}
+
 /**
  * 解析某 scope 的最低输出级别
  *
  * 环境变量控制（不影响主程序默认行为）：
  *   - SPRR_LOG_SCOPE=xxx：仅该 scope 按 SPRR_LOG_LEVEL 过滤，其他 scope 最低输出 WARN
  *   - SPRR_LOG_LEVEL=debug|info|warn|error：全局最低级别
- *   - 都不设置：全输出（兼容主程序）
+ *   - 都不设置：INFO；REPL --verbose 时 DEBUG
  */
 function getMinLevel(scope: string): number {
   const envScope = process.env.SPRR_LOG_SCOPE;
@@ -41,9 +59,9 @@ function getMinLevel(scope: string): number {
   }
   if (envLevel) {
     const lv = envLevel.toLowerCase() as Level;
-    return LEVEL_PRIORITY[lv] ?? LEVEL_PRIORITY.debug;
+    return LEVEL_PRIORITY[lv] ?? (verbose ? LEVEL_PRIORITY.debug : LEVEL_PRIORITY.info);
   }
-  return LEVEL_PRIORITY.debug;
+  return verbose ? LEVEL_PRIORITY.debug : LEVEL_PRIORITY.info;
 }
 
 function formatTime(): string {
@@ -86,7 +104,7 @@ export function createLogger(scope: string): Logger {
     const color = LEVEL_COLORS[level];
     const time = formatTime();
     const suffix = args.length > 0 ? ' ' + args.map(serialize).join(' ') : '';
-    process.stderr.write(`${color}[${time}] [${level.toUpperCase()}] [${scope}]${RESET} ${msg}${suffix}\n`);
+    process.stderr.write(`${color}[${time}] [${level.toUpperCase()}] [${scope}]${RESET} ${redactLogText(msg + suffix)}\n`);
   };
 
   return {

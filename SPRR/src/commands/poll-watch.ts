@@ -17,6 +17,7 @@ import {
   type PollMessage,
 } from '../api/polling.js';
 import type { RequestEnv } from '../api/imapi.js';
+import { watchControl } from '../cli/watch-control.js';
 
 const log = createLogger('cmd-poll-watch');
 
@@ -36,6 +37,7 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
  * 循环结束/异常均正常返回；致命错误（如 init 失败、cookie 失效）抛出。
  */
 export async function runPollingWatch(opts: PollWatchOptions): Promise<void> {
+  if (watchControl.stopRequested) return;
   const { env, myUid, onMessage } = opts;
   const intervalMs = opts.intervalMs ?? 3000;
 
@@ -43,6 +45,7 @@ export async function runPollingWatch(opts: PollWatchOptions): Promise<void> {
   let cursors;
   let lastInitErr: unknown = null;
   for (let attempt = 1; attempt <= 3; attempt++) {
+    if (watchControl.stopRequested) return;
     try {
       cursors = await initMessageSync(env);
       lastInitErr = null;
@@ -56,6 +59,7 @@ export async function runPollingWatch(opts: PollWatchOptions): Promise<void> {
   if (!cursors) {
     throw new Error(`消息同步初始化失败: ${lastInitErr}`);
   }
+  if (watchControl.stopRequested) return;
   log.info(
     `游标就绪: msgCursor=${cursors.messageCursorUs} inboxSeq=${cursors.inboxSeq}`,
   );
@@ -66,8 +70,10 @@ export async function runPollingWatch(opts: PollWatchOptions): Promise<void> {
 
   const onSigInt = () => {
     running = false;
+    watchControl.requestStop();
   };
   process.on('SIGINT', onSigInt);
+  const unregisterStop = watchControl.registerStop(onSigInt);
 
   log.info(`${C.cyan}[watch]${C.reset} 轮询已启动（间隔 ${intervalMs}ms，Ctrl+C 停止）`);
   try {
@@ -108,6 +114,7 @@ export async function runPollingWatch(opts: PollWatchOptions): Promise<void> {
       await sleep(intervalMs + Math.floor(Math.random() * 1000));
     }
   } finally {
+    unregisterStop();
     process.removeListener('SIGINT', onSigInt);
     log.info(`${C.yellow}[watch]${C.reset} 轮询已停止`);
   }

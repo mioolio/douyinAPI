@@ -88,6 +88,71 @@ export interface ContactItem {
   _participants?: Array<{ uid: string; secUid: string }>;
 }
 
+/** 单个联系人来源的拉取状态；complete 才能证明空结果确实为空。 */
+export interface ContactListBranchResult {
+  contacts: ContactItem[];
+  complete: boolean;
+  pages: number;
+  statusCode?: number;
+  error?: string;
+  rateLimited: boolean;
+}
+
+export interface ContactListResult {
+  contacts: ContactItem[];
+  regular: ContactListBranchResult | null;
+  stranger: ContactListBranchResult | null;
+  complete: boolean;
+}
+
+export interface ContactListOptions {
+  includeRegular?: boolean;
+  includeStrangers?: boolean;
+}
+
+function recordContactListException(branch: ContactListBranchResult, error: unknown): void {
+  branch.error = error instanceof Error ? error.message : String(error);
+  const httpStatus = branch.error.match(/\bHTTP\s+(\d{3})\b/i);
+  if (httpStatus) branch.statusCode = Number(httpStatus[1]);
+  branch.rateLimited = branch.statusCode === 409 || branch.statusCode === 429 ||
+    /too many requests|rate.?limit/i.test(branch.error);
+}
+
+function completeVarintEnd(buffer: Buffer, offset: number, label: string): number {
+  for (let count = 0; count < 10 && offset < buffer.length; count++) {
+    if ((buffer[offset++] & 0x80) === 0) return offset;
+  }
+  throw new Error(`${label} 包含截断或无效的 varint`);
+}
+
+function parseCompleteFields(buffer: Buffer, label: string): ProtobufField[] {
+  const fields = parseFields(buffer);
+  let end = 0;
+  for (const field of fields) {
+    const valueOffset = completeVarintEnd(buffer, field.offset, label);
+    if (field.wire === WireType.LengthDelimited || field.wire === WireType.Varint) {
+      completeVarintEnd(buffer, valueOffset, label);
+    }
+    if (field.field <= 0 || field.offset !== end || field.length <= 0 ||
+      field.offset + field.length > buffer.length ||
+      (field.wire === WireType.Varint && (buffer[field.offset + field.length - 1] & 0x80) !== 0)) {
+      throw new Error(`${label} 包含截断或无效的 protobuf 字段`);
+    }
+    end = field.offset + field.length;
+  }
+  if (end !== buffer.length) throw new Error(`${label} 包含未完整解析的 protobuf 字节`);
+  return fields;
+}
+
+/** 零长度嵌套 message 是合法空响应；缺失、错误 wire 或截断数据不是空结果。 */
+export function readImapiResponseBody(body: Buffer, bodyType: number): ProtobufField[] {
+  const fields = parseCompleteFields(body, 'IM 响应');
+  const nested = findField(fields, bodyType);
+  if (!nested) throw new Error(`IM 响应缺少 body ${bodyType}`);
+  if (nested.wire !== WireType.LengthDelimited) throw new Error(`IM 响应 body ${bodyType} 类型错误`);
+  return parseCompleteFields(nested.value as Buffer, `IM 响应 body ${bodyType}`);
+}
+
 /**
  * 消息类别
  *   - text        普通文本消息（aweType=700, msgType=7）
@@ -183,135 +248,200 @@ export function envFromSession(session: SessionData): RequestEnv {
  * @returns 联系人列表
  */
 export async function listContacts(env: RequestEnv): Promise<ContactItem[]> {
+  return (await listContactsResult(env)).contacts.map((contact) => {
+    const copy = { ...contact };
+    delete copy._participants;
+    return copy;
+  });
+}
+
+/**
+ * 拉取联系人及来源状态。缓存层可独立刷新常规/陌生人会话，
+ * 并区分成功空结果、限流和只取得部分分页的结果。
+ * sendImapi 可注入，便于离线验证错误和分页分支。
+ */
+export async function listContactsResult(
+  env: RequestEnv,
+  options: ContactListOptions = {},
+  dependencies: { sendImapi?: typeof sendImapi } = {},
+): Promise<ContactListResult> {
+  const send = dependencies.sendImapi ?? sendImapi;
   const items: ContactItem[] = [];
+  const regular: ContactListBranchResult | null = options.includeRegular === false
+    ? null : { contacts: [], complete: false, pages: 0, rateLimited: false };
+  const stranger: ContactListBranchResult | null = options.includeStrangers === false
+    ? null : { contacts: [], complete: false, pages: 0, rateLimited: false };
 
   // 1. 主流程：cmd=2006 列出常规会话（分页拉取）
-  log.info(`listContacts: 调用 cmd=2006 (GET_USER_CONVERSATION_LIST)`);
-  let cursor = 0;
-  const pageSize = 50;
-  let pageCount = 0;
-  const maxPages = 40; // 安全上限：40 页 × 50 = 2000 条
-  let consecutiveEmpty = 0; // 连续空页计数
-  try {
-    while (pageCount < maxPages) {
-      pageCount++;
-      // body 字段号（从 SDK 源码 c58fe...js 的 GetUserConversationListRequestBody.encode 逆向）：
-      const subBody = Buffer.concat([
-        encodeVarintField(1, 2), // sort_type=2 (按最近消息时间排序，最近活跃优先)
-        encodeVarintField(2, cursor), // cursor
-        encodeVarintField(3, 1), // con_type=1 私聊
-        encodeVarintField(4, pageSize), // limit
-        encodeVarintField(5, 0), // include_role=0
-        encodeVarintField(6, 0), // exclude_role=0
-        // field 8 with_cold 跳过 (default false)
-        // field 10 push_status 跳过 (default 0)
-      ]);
-      const body = encodeBytesField(2006, subBody);
+  if (regular) {
+    log.info(`listContacts: 调用 cmd=2006 (GET_USER_CONVERSATION_LIST)`);
+    let cursor = 0;
+    const pageSize = 50;
+    let pageCount = 0;
+    const maxPages = 40; // 安全上限：40 页 × 50 = 2000 条
+    let consecutiveEmpty = 0; // 连续空页计数
+    try {
+      while (pageCount < maxPages) {
+        pageCount++;
+        // body 字段号（从 SDK 源码 c58fe...js 的 GetUserConversationListRequestBody.encode 逆向）：
+        const subBody = Buffer.concat([
+          encodeVarintField(1, 2), // sort_type=2 (按最近消息时间排序，最近活跃优先)
+          encodeVarintField(2, cursor), // cursor
+          encodeVarintField(3, 1), // con_type=1 私聊
+          encodeVarintField(4, pageSize), // limit
+          encodeVarintField(5, 0), // include_role=0
+          encodeVarintField(6, 0), // exclude_role=0
+          // field 8 with_cold 跳过 (default false)
+          // field 10 push_status 跳过 (default 0)
+        ]);
+        const body = encodeBytesField(2006, subBody);
 
-      const reqBuf = buildRequest({
-        cmd: 2006, // GET_USER_CONVERSATION_LIST
-        sequenceId: nextSeq(),
-        inboxType: 0,
-        body,
-        env,
-      });
+        const reqBuf = buildRequest({
+          cmd: 2006, // GET_USER_CONVERSATION_LIST
+          sequenceId: nextSeq(),
+          inboxType: 0,
+          body,
+          env,
+        });
 
-      const resp = await sendImapi({
-        path: '/v1/conversation/list',
-        body: reqBuf,
-        cookie: env.cookie,
-      });
-      log.info(
-        `listContacts: cmd=2006 page=${pageCount} cursor=${cursor} status=${resp.statusCode} desc=${resp.errorDesc} body=${resp.body.length}B`,
-      );
-      if (resp.statusCode !== 0) break;
+        const resp = await send({
+          path: '/v1/conversation/list',
+          body: reqBuf,
+          cookie: env.cookie,
+        });
+        log.info(
+          `listContacts: cmd=2006 page=${pageCount} cursor=${cursor} status=${resp.statusCode} desc=${resp.errorDesc} body=${resp.body.length}B`,
+        );
+        regular.pages = pageCount;
+        regular.statusCode = resp.statusCode;
+        if (resp.statusCode !== 0) {
+          regular.error = resp.errorDesc || `IM status=${resp.statusCode}`;
+          regular.rateLimited = resp.statusCode === 409 || resp.statusCode === 429 || /too many requests|rate.?limit/i.test(resp.errorDesc);
+          break;
+        }
 
-      const pageItems = parseUserConvListResponse(resp, 2006);
-      items.push(...pageItems);
+        const subFields = readImapiResponseBody(resp.body, 2006);
+        const pageItems = parseUserConvListResponse(resp, 2006);
+        items.push(...pageItems);
+        regular.contacts.push(...pageItems);
 
-      // 解析 has_more / next_cursor
-      const bodyFields = parseFields(resp.body);
-      const subField = findField(bodyFields, 2006);
-      if (!subField) break;
-      const subFields = readMessage(subField);
-      const hasMore = findField(subFields, 2) ? readVarint(findField(subFields, 2)!) : 0;
-      const nextCursor = findField(subFields, 3) ? readVarint(findField(subFields, 3)!) : 0;
-      log.info(
-        `listContacts: page=${pageCount} got=${pageItems.length} total=${items.length} hasMore=${hasMore} nextCursor=${nextCursor}`,
-      );
-      // 空页保护：连续 2 次空页则停
-      if (pageItems.length === 0) {
-        consecutiveEmpty++;
-        if (consecutiveEmpty >= 2) break;
-      } else {
-        consecutiveEmpty = 0;
+        // 解析 has_more / next_cursor
+        const hasMore = findField(subFields, 2) ? readVarint(findField(subFields, 2)!) : 0;
+        const nextCursor = findField(subFields, 3) ? readVarint(findField(subFields, 3)!) : 0;
+        log.info(
+          `listContacts: page=${pageCount} got=${pageItems.length} total=${items.length} hasMore=${hasMore} nextCursor=${nextCursor}`,
+        );
+        // 空页保护：连续 2 次空页则停
+        if (pageItems.length === 0) {
+          consecutiveEmpty++;
+          if (consecutiveEmpty >= 2 && hasMore) {
+            regular.error = '连续空页，常规会话可能未拉完';
+            break;
+          }
+        } else {
+          consecutiveEmpty = 0;
+        }
+        if (!hasMore) {
+          regular.complete = true;
+          break;
+        }
+        if (nextCursor <= cursor) {
+          regular.error = '常规会话游标未前进，可能未拉完';
+          break;
+        }
+        cursor = nextCursor;
       }
-      if (!hasMore || nextCursor <= cursor) break;
-      cursor = nextCursor;
+      if (!regular.complete && !regular.error) regular.error = '已达常规会话分页上限，可能未拉完';
+      if (regular.complete) {
+        log.info(`listContacts: cmd=2006 完成，共 ${pageCount} 页 ${regular.contacts.length} 个会话`);
+      } else {
+        log.warn(`listContacts: cmd=2006 未完成，保留 ${regular.contacts.length} 个会话：${regular.error}`);
+      }
+    } catch (e) {
+      regular.pages = pageCount;
+      recordContactListException(regular, e);
+      log.warn(`listContacts: cmd=2006 失败`, e);
     }
-    log.info(`listContacts: cmd=2006 完成，共 ${pageCount} 页 ${items.length} 个会话${pageCount >= maxPages ? '（已达 maxPages 上限，可能未拉完）' : ''}`);
-  } catch (e) {
-    log.warn(`listContacts: cmd=2006 失败`, e);
   }
 
   // 2. 补充：cmd=1001 列出陌生人会话（inbox_type=1，分页拉全）
-  log.info(`listContacts: 调用 cmd=1001 (STRANGER_GET_CONVERSATION_LIST)`);
-  try {
-    // 字段号（从 SDK 源码 GetStrangerConversationListRequestBody 逆向）：
-    //   field 1 (int64): cursor
-    //   field 2 (int64): count (default=50)
-    //   field 3 (bool):  show_total_unread
-    let strangerCursor = 0;
-    let strangerPage = 0;
-    const strangerMaxPages = 40;
-    let strangerTotal = 0;
-    while (strangerPage < strangerMaxPages) {
-      strangerPage++;
-      const subBody = Buffer.concat([
-        encodeVarintField(1, strangerCursor), // cursor
-        encodeVarintField(2, 50), // count=50
-      ]);
-      const body = encodeBytesField(1000, subBody);
+  if (stranger) {
+    log.info(`listContacts: 调用 cmd=1001 (STRANGER_GET_CONVERSATION_LIST)`);
+    try {
+      // 字段号（从 SDK 源码 GetStrangerConversationListRequestBody 逆向）：
+      //   field 1 (int64): cursor
+      //   field 2 (int64): count (default=50)
+      //   field 3 (bool):  show_total_unread
+      let strangerCursor = 0;
+      let strangerPage = 0;
+      const strangerMaxPages = 40;
+      let strangerTotal = 0;
+      while (strangerPage < strangerMaxPages) {
+        strangerPage++;
+        stranger.pages = strangerPage;
+        const subBody = Buffer.concat([
+          encodeVarintField(1, strangerCursor), // cursor
+          encodeVarintField(2, 50), // count=50
+        ]);
+        const body = encodeBytesField(1000, subBody);
 
-      const reqBuf = buildRequest({
-        cmd: IMAPI_CONSTANTS.IMCMD.STRANGER_GET_CONVERSATION_LIST,
-        sequenceId: nextSeq(),
-        inboxType: 1,
-        body,
-        env,
-      });
+        const reqBuf = buildRequest({
+          cmd: IMAPI_CONSTANTS.IMCMD.STRANGER_GET_CONVERSATION_LIST,
+          sequenceId: nextSeq(),
+          inboxType: 1,
+          body,
+          env,
+        });
 
-      const resp = await sendImapi({
-        path: '/v1/stranger/get_conversation_list',
-        body: reqBuf,
-        cookie: env.cookie,
-      });
-      log.info(
-        `listContacts: cmd=1001 page=${strangerPage} cursor=${strangerCursor} status=${resp.statusCode} desc=${resp.errorDesc} body=${resp.body.length}B`,
-      );
-      if (resp.statusCode !== 0) break;
+        const resp = await send({
+          path: '/v1/stranger/get_conversation_list',
+          body: reqBuf,
+          cookie: env.cookie,
+        });
+        log.info(
+          `listContacts: cmd=1001 page=${strangerPage} cursor=${strangerCursor} status=${resp.statusCode} desc=${resp.errorDesc} body=${resp.body.length}B`,
+        );
+        stranger.pages = strangerPage;
+        stranger.statusCode = resp.statusCode;
+        if (resp.statusCode !== 0) {
+          stranger.error = resp.errorDesc || `IM status=${resp.statusCode}`;
+          stranger.rateLimited = resp.statusCode === 409 || resp.statusCode === 429 || /too many requests|rate.?limit/i.test(resp.errorDesc);
+          break;
+        }
 
-      const strangerItems = parseStrangerListResponse(resp, 1000);
-      for (const it of strangerItems) it.isStranger = true;
-      items.push(...strangerItems);
-      strangerTotal += strangerItems.length;
+        const sSubFields = readImapiResponseBody(resp.body, 1000);
+        const strangerItems = parseStrangerListResponse(resp, 1000);
+        for (const it of strangerItems) it.isStranger = true;
+        items.push(...strangerItems);
+        stranger.contacts.push(...strangerItems);
+        strangerTotal += strangerItems.length;
 
-      // 解析陌生人列表的 has_more / next_cursor
-      const sBodyFields = parseFields(resp.body);
-      const sSubField = findField(sBodyFields, 1000);
-      if (!sSubField) break;
-      const sSubFields = readMessage(sSubField);
-      const sHasMore = findField(sSubFields, 2) ? readVarint(findField(sSubFields, 2)!) : 0;
-      const sNextCursor = findField(sSubFields, 3) ? readVarint(findField(sSubFields, 3)!) : 0;
-      log.info(
-        `listContacts: cmd=1001 page=${strangerPage} got=${strangerItems.length} stranger_total=${strangerTotal} hasMore=${sHasMore} nextCursor=${sNextCursor}`,
-      );
-      if (!sHasMore || sNextCursor <= strangerCursor || strangerItems.length === 0) break;
-      strangerCursor = sNextCursor;
+        // 解析陌生人列表的 has_more / next_cursor
+        const sHasMore = findField(sSubFields, 2) ? readVarint(findField(sSubFields, 2)!) : 0;
+        const sNextCursor = findField(sSubFields, 1) ? readVarint(findField(sSubFields, 1)!) : 0;
+        log.info(
+          `listContacts: cmd=1001 page=${strangerPage} got=${strangerItems.length} stranger_total=${strangerTotal} hasMore=${sHasMore} nextCursor=${sNextCursor}`,
+        );
+        if (!sHasMore) {
+          stranger.complete = true;
+          break;
+        }
+        if (sNextCursor <= strangerCursor || strangerItems.length === 0) {
+          stranger.error = '陌生人会话分页未前进，可能未拉完';
+          break;
+        }
+        strangerCursor = sNextCursor;
+      }
+      if (!stranger.complete && !stranger.error) stranger.error = '已达陌生人会话分页上限，可能未拉完';
+      if (stranger.complete) {
+        log.info(`listContacts: cmd=1001 完成，共 ${strangerPage} 页 ${strangerTotal} 个陌生人会话`);
+      } else {
+        log.warn(`listContacts: cmd=1001 未完成，保留 ${strangerTotal} 个陌生人会话：${stranger.error}`);
+      }
+    } catch (e) {
+      recordContactListException(stranger, e);
+      log.warn(`listContacts: cmd=1001 失败`, e);
     }
-    log.info(`listContacts: cmd=1001 完成，共 ${strangerPage} 页 ${strangerTotal} 个陌生人会话`);
-  } catch (e) {
-    log.warn(`listContacts: cmd=1001 失败`, e);
   }
 
   log.info(`listContacts: 共 ${items.length} 个会话`);
@@ -352,10 +482,14 @@ export async function listContacts(env: RequestEnv): Promise<ContactItem[]> {
     log.info(`listContacts: 识别 myUid=${myUid}，已修正 peerUid/peerSecUid`);
   }
 
-  // 清理内部字段（不需要暴露给外部）
-  for (const c of items) delete c._participants;
+  // participants 留给缓存合并/真实身份查询后的校正；旧 listContacts 包装会剥离。
 
-  return items;
+  return {
+    contacts: items,
+    regular,
+    stranger,
+    complete: (regular?.complete ?? true) && (stranger?.complete ?? true),
+  };
 }
 
 /**
@@ -549,32 +683,25 @@ function extractSecUid(field: ProtobufField | undefined): string {
 /**
  * 从会话列表中识别当前账号的 uid
  *
- * 原理：每个会话的 participants 都包含我自己，统计所有 uid 出现频率，
- *      出现在最多会话中的 uid 就是 myUid。
+ * 不同私聊会话参与者的交集只有一个 UID 时才能确认身份。
+ * 单会话和重复会话的两位参与者不能用于判断当前用户。
  *
  * @returns 识别到的 myUid，若无法识别返回空字符串
  */
 export function detectMyUid(contacts: ContactItem[]): string {
-  const uidCount = new Map<string, number>();
-  // 通过 cid 反推：cid 格式 "0:1:<uidA>:<uidB>"，myUid 会出现在所有会话的 cid 中
+  const seen = new Set<string>();
+  let shared: Set<string> | undefined;
+  // 当前账号必须是所有不同私聊会话的唯一公共参与者。
+  // 单会话双方、重复同一会话、非私聊或不一致的会话均不能证明身份。
   for (const c of contacts) {
-    const parts = c.conversationId.split(':');
-    if (parts.length < 4) continue;
-    const a = parts[2];
-    const b = parts[3];
-    uidCount.set(a, (uidCount.get(a) || 0) + 1);
-    uidCount.set(b, (uidCount.get(b) || 0) + 1);
+    const match = c.conversationId.match(/^0:1:([1-9]\d*):([1-9]\d*)$/);
+    if (!match || seen.has(c.conversationId)) continue;
+    seen.add(c.conversationId);
+    const pair = new Set([match[1], match[2]]);
+    shared = shared === undefined ? pair : new Set([...shared].filter((uid) => pair.has(uid)));
+    if (shared.size === 0) return '';
   }
-  // 出现频率最高的就是 myUid
-  let bestUid = '';
-  let bestCount = 0;
-  for (const [uid, count] of uidCount) {
-    if (count > bestCount) {
-      bestUid = uid;
-      bestCount = count;
-    }
-  }
-  return bestUid;
+  return shared?.size === 1 ? shared.values().next().value! : '';
 }
 
 /**
@@ -640,6 +767,8 @@ export function extractUidFromCid(cid: string, myUid?: string): string {
 
 /** 构造私聊 conversation_id（格式: "0:1:<myUid>:<peerUid>"，较小 uid 在前） */
 export function buildPrivateCid(myUid: string, peerUid: string): string {
+  if (!/^[1-9]\d*$/.test(myUid)) throw new Error('无法确认当前账号 UID，不能构造私聊会话');
+  if (!/^[1-9]\d*$/.test(peerUid)) throw new Error('目标用户 UID 无效，不能构造私聊会话');
   const a = BigInt(myUid);
   const b = BigInt(peerUid);
   const [x, y] = a <= b ? [myUid, peerUid] : [peerUid, myUid];
@@ -746,7 +875,7 @@ export async function getHistory(
     log.error(
       `getHistory: 失败 status=${resp.statusCode} desc=${resp.errorDesc} logId=${resp.logId}`,
     );
-    return [];
+    throw new Error(`获取聊天记录失败: status=${resp.statusCode} desc=${resp.errorDesc}`);
   }
 
   const parsed = parseHistoryResponseEx(resp, bodyType, conversationId, opts.myUid);
@@ -825,7 +954,7 @@ export async function getHistoryEx(
     log.error(
       `getHistoryEx: 失败 status=${resp.statusCode} desc=${resp.errorDesc} logId=${resp.logId}`,
     );
-    return { messages: [], nextCursor: 0n, hasMore: false };
+    throw new Error(`获取聊天记录失败: status=${resp.statusCode} desc=${resp.errorDesc}`);
   }
 
   return parseHistoryResponseEx(resp, bodyType, conversationId, opts.myUid);
@@ -911,10 +1040,11 @@ export async function getHistoryAll(
 
   // 按时间升序排列
   allMessages.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
+  const limitedMessages = allMessages.slice(-maxMessages);
   log.info(
-    `getHistoryAll: 共拉取 ${pageCount} 页，${allMessages.length} 条消息（去重后）`,
+    `getHistoryAll: 共拉取 ${pageCount} 页，${limitedMessages.length} 条消息（去重并按上限截取）`,
   );
-  return allMessages;
+  return limitedMessages;
 }
 
 /** 解析 cmd=301 响应 body 为消息列表（含分页元数据） */
@@ -925,13 +1055,7 @@ function parseHistoryResponseEx(
   myUid?: string,
 ): HistoryResult {
   const items: MessageItem[] = [];
-  const bodyFields = parseFields(resp.body);
-  const subField = findField(bodyFields, bodyType);
-  if (!subField) {
-    log.warn(`parseHistoryResponseEx: 响应 body 中未找到 sub-field ${bodyType}`);
-    return { messages: items, nextCursor: 0n, hasMore: false };
-  }
-  const subFields = readMessage(subField);
+  const subFields = readImapiResponseBody(resp.body, bodyType);
   log.debug(
     `parseHistoryResponseEx: sub-fields=${subFields.length} keys=${subFields.map((f) => f.field).join(',')}`,
   );

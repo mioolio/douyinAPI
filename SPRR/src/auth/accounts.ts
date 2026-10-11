@@ -118,6 +118,8 @@ export async function setCurrentAccount(name: string): Promise<void> {
 /** 删除指定账号 */
 export async function deleteAccount(name: string): Promise<void> {
   validateAccountName(name);
+  // Read the pointer before deleting the file: getCurrentAccount checks file existence.
+  const current = await getCurrentAccount();
   const file = accountFile(name);
   try {
     await fs.unlink(file);
@@ -128,7 +130,6 @@ export async function deleteAccount(name: string): Promise<void> {
     throw e;
   }
   // 如果删除的是当前账号，清空指针
-  const current = await getCurrentAccount();
   if (current === name) {
     try {
       await fs.unlink(CURRENT_ACCOUNT_FILE);

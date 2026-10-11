@@ -159,7 +159,7 @@ export function sm3(data: Uint8Array): Uint8Array {
   dv.setUint32(padLen - 8, Number(bitLen >> 32n));
   dv.setUint32(padLen - 4, Number(bitLen & 0xffffffffn));
 
-  let V = SM3_IV.slice();
+  let V: Uint32Array = SM3_IV.slice();
   const blocks = Math.floor(padLen / 64);
   for (let i = 0; i < blocks; i++) {
     const block = padded.subarray(i * 64, (i + 1) * 64);

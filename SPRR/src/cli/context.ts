@@ -19,12 +19,15 @@ import {
 import { resolveStorageState } from '../auth/accounts.js';
 import {
   envFromSession,
-  listContacts,
+  listContactsResult,
   buildPrivateCid,
   detectMyUid,
   type ContactItem,
 } from '../api/operations.js';
 import { getUserInfoMap } from '../api/webapi.js';
+import { ContactCache } from './contact-cache.js';
+import { accountCacheKey, clearMessageCache, getCachedMessage } from './message-cache.js';
+export { cacheMessages, getCachedMessage, markMessageRecalled, isMessageRecalled } from './message-cache.js';
 
 const log = createLogger('cli-ctx');
 
@@ -44,7 +47,43 @@ export const cliState = {
 let _session: SessionData | null = null;
 let _env: ReturnType<typeof envFromSession> | null = null;
 /** 缓存的联系人列表 */
-let _contactsCache: ContactItem[] | null = null;
+let _sessionKey: string | null = null;
+let _currentConversation: ContactItem | null = null;
+let _lastContactList: ContactItem[] = [];
+let _sessionGeneration = 0;
+const contactsCache = new ContactCache({
+  fetchContacts: listContactsResult,
+  fetchNames: getUserInfoMap,
+  fetchSelfUid: async (env) => (await (await import('../commands/profile.js')).getSelfProfile(env)).uid,
+});
+
+export interface SessionSource { statePath?: string; account?: string; cookie?: string }
+let persistentSource: SessionSource = {};
+
+export function getDefaultSessionSource(): SessionSource {
+  return { ...persistentSource };
+}
+
+export async function setSessionSource(source: SessionSource, persistent = true): Promise<void> {
+  if (persistent) persistentSource = { ...source };
+  const changed = cliState.statePath !== source.statePath || cliState.account !== source.account || cliState.cookie !== source.cookie;
+  cliState.statePath = source.statePath;
+  cliState.account = source.account;
+  cliState.cookie = source.cookie;
+  if (changed) await clearCache();
+}
+
+/** Global account overrides apply to one command; cookie/use commands set the REPL default. */
+export async function applyCommandSessionSource(options: { state?: string; account?: string; cookie?: string }): Promise<void> {
+  const source: SessionSource = options.cookie ? { cookie: options.cookie }
+    : options.state ? { statePath: options.state }
+    : options.account ? { account: options.account } : persistentSource;
+  await setSessionSource(source, false);
+}
+
+export async function restoreCommandSessionSource(): Promise<void> {
+  await setSessionSource(persistentSource, false);
+}
 
 // ============================ 别名管理 ============================
 
@@ -69,23 +108,33 @@ export async function ensureSession(): Promise<{
   session: SessionData;
   env: ReturnType<typeof envFromSession>;
 }> {
-  if (_session && _env) return { session: _session, env: _env };
+  let statePath: string | undefined;
+  let sourceKey: string;
+  if (cliState.cookie) {
+    sourceKey = `cookie:${accountCacheKey({ cookie: cliState.cookie })}`;
+  } else {
+    const resolved = await resolveStorageState(cliState.statePath, cliState.account);
+    statePath = resolved.path;
+    const stat = await fs.stat(statePath);
+    sourceKey = `${path.resolve(statePath)}:${stat.mtimeMs}:${stat.size}`;
+  }
+  if (_session && _env && _sessionKey === sourceKey) return { session: _session, env: _env };
+  if (_sessionKey !== null) await clearCache();
   if (cliState.cookie) {
     log.debug('使用直接传入的 cookie 字符串（无需登录）');
     _session = sessionFromCookieString(cliState.cookie);
   } else {
-    const { path: statePath, source } = await resolveStorageState(cliState.statePath, cliState.account);
-    log.debug(`使用 storageState: ${statePath}（来源: ${source}）`);
-    _session = await loadFromStorageState(statePath);
+    log.debug(`使用 storageState: ${statePath}`);
+    _session = await loadFromStorageState(statePath!);
   }
+  _sessionKey = sourceKey;
   _env = envFromSession(_session);
   return { session: _session, env: _env };
 }
 
 /** 设置 cookie 字符串（REPL 内 cookie 命令调用），同时清除缓存 */
-export function setCookie(cookieStr: string): void {
-  cliState.cookie = cookieStr;
-  clearCache();
+export async function setCookie(cookieStr: string): Promise<void> {
+  await setSessionSource({ cookie: cookieStr });
 }
 
 /**
@@ -93,12 +142,17 @@ export function setCookie(cookieStr: string): void {
  *
  * 同时关闭常驻浏览器实例，避免旧会话的浏览器被复用。
  */
-export function clearCache(): void {
+export async function clearCache(): Promise<void> {
+  _sessionGeneration++;
   _session = null;
   _env = null;
-  _contactsCache = null;
+  _sessionKey = null;
+  _currentConversation = null;
+  _lastContactList = [];
+  contactsCache.clear();
+  clearMessageCache();
   // 关闭常驻浏览器单例（切换账号后 storageState 变了，旧浏览器不能复用）
-  void closeBrowserSenderSafe();
+  await closeBrowserSenderSafe();
 }
 
 // 延迟导入避免循环依赖：browser-pool 会被命令模块使用，
@@ -107,8 +161,8 @@ async function closeBrowserSenderSafe(): Promise<void> {
   try {
     const { closeBrowserSender } = await import('../commands/browser-pool.js');
     await closeBrowserSender();
-  } catch {
-    // 模块未加载时忽略
+  } catch (error) {
+    log.warn('关闭浏览器失败', error);
   }
 }
 
@@ -163,27 +217,67 @@ export async function run(
 // ============================ 联系人缓存 ============================
 
 /** 获取联系人列表（缓存） */
-export async function getContacts(env: ReturnType<typeof envFromSession>): Promise<ContactItem[]> {
-  if (!_contactsCache) {
-    _contactsCache = await listContacts(env);
-    const secUidsToFetch = _contactsCache
-      .filter((c) => c.secUid && c.nickname === '(pending)')
-      .map((c) => c.secUid!) as string[];
-    if (secUidsToFetch.length > 0) {
-      log.info(`getContacts: 批量获取 ${secUidsToFetch.length} 个用户的 nickname...`);
-      const userInfoMap = await getUserInfoMap(env, secUidsToFetch);
-      for (const c of _contactsCache) {
-        if (!c.secUid) continue;
-        const info = userInfoMap.get(c.secUid);
-        if (info && info.nickname) {
-          c.nickname = info.nickname;
-        } else if (c.nickname === '(pending)') {
-          c.nickname = `(uid:${c.uid.slice(-6)})`;
-        }
-      }
-    }
+export async function getContacts(
+  env: ReturnType<typeof envFromSession>,
+  options: { refresh?: boolean; refreshStrangers?: boolean } = {},
+): Promise<ContactItem[]> {
+  const result = await contactsCache.get(accountCacheKey(env), env, {
+    refreshRegular: options.refresh,
+    refreshStrangers: options.refreshStrangers,
+  });
+  if (result.identityError) log.warn(`当前账号身份未确认：${result.identityError}`);
+  for (const failure of result.failures) {
+    log.warn(`${failure.source === 'stranger' ? '陌生人会话' : '常规会话'}查询未完成：${failure.error}${result.stale ? '；保留此前可用数据' : ''}`);
   }
-  return _contactsCache;
+  if (result.contacts.length === 0 && !result.complete) {
+    throw new Error('联系人查询失败，不能将失败结果视为空会话列表；请稍后重试');
+  }
+  return result.contacts;
+}
+
+/** Never guess the sender in a tied/single-conversation list. */
+export function getMyUid(env: ReturnType<typeof envFromSession>): string {
+  const uid = contactsCache.getMyUid(accountCacheKey(env));
+  if (!uid) throw new Error('无法确定当前账号数字 UID，不能操作会话；请刷新 list 后重试');
+  return uid;
+}
+
+export function getCurrentConversation(): ContactItem | null {
+  return _currentConversation ? { ..._currentConversation } : null;
+}
+export function setCurrentConversation(contact: ContactItem): void {
+  _currentConversation = { ...contact };
+}
+export function recordContactList(contacts: ContactItem[]): void {
+  _lastContactList = contacts.map((contact) => ({ ...contact }));
+}
+export function resolveCommandTargetName(target?: string): string | null {
+  return target?.trim() || _currentConversation?.conversationId || null;
+}
+
+/** Read only the already-loaded account cache; missing targets must not trigger authentication. */
+export function getCachedReference(id: string) {
+  return _env ? getCachedMessage(_env, id) : null;
+}
+
+export interface CommandTargetSelection {
+  name: string;
+  implicit: boolean;
+  sessionGeneration: number;
+}
+
+/** Capture a local selection without loading credentials; verify it again after run loads the session. */
+export function captureCommandTarget(target?: string, referenceId?: string): CommandTargetSelection | null {
+  const explicit = target?.trim();
+  const name = explicit || (referenceId ? getCachedReference(referenceId)?.cid : undefined) || _currentConversation?.conversationId;
+  return name ? { name, implicit: !explicit, sessionGeneration: _sessionGeneration } : null;
+}
+
+export function confirmCommandTarget(selection: CommandTargetSelection): string {
+  if (selection.implicit && selection.sessionGeneration !== _sessionGeneration) {
+    throw new Error('登录态已变化，之前选择的会话已失效；请重新运行 history --to <目标>，或显式指定 --to');
+  }
+  return selection.name;
 }
 
 // ============================ 目标解析 ============================
@@ -191,7 +285,7 @@ export async function getContacts(env: ReturnType<typeof envFromSession>): Promi
 /** 解析目标用户 */
 export async function resolveTarget(
   env: ReturnType<typeof envFromSession>,
-  target: string,
+  target: string | undefined,
   myUid: string,
   contacts: ContactItem[],
 ): Promise<{
@@ -200,6 +294,14 @@ export async function resolveTarget(
   conversationShortId: string;
   ticket?: string;
 } | null> {
+  const selected = resolveCommandTargetName(target);
+  if (!selected) throw new Error('请先用 history --to <用户> 选择会话，或显式指定 --to <用户>');
+  target = selected;
+  if (/^#\d+$/.test(target)) {
+    const contact = _lastContactList[Number(target.slice(1)) - 1];
+    if (!contact) throw new Error(`无效会话序号 ${target}；请先运行 list，再使用 --to #序号`);
+    target = contact.conversationId;
+  }
   if (/^\d+$/.test(target)) {
     const c = contacts.find((x) => x.uid === target);
     if (c && c.conversationShortId) {
@@ -224,12 +326,16 @@ export async function resolveTarget(
       };
     }
   }
-  let match = contacts.find((c) => c.nickname === target || c.remark === target);
-  if (!match) {
-    match = contacts.find(
+  let matches = contacts.filter((c) => c.nickname === target || c.remark === target);
+  if (matches.length === 0) {
+    matches = contacts.filter(
       (c) => c.nickname.includes(target) || (c.remark && c.remark.includes(target)),
     );
   }
+  if (matches.length > 1) {
+    throw new Error(`目标“${target}”匹配多个会话：${matches.map((c) => `${c.nickname} (UID ${c.uid})`).join('、')}；请使用 UID 或会话 ID`);
+  }
+  const match = matches[0];
   if (match && match.conversationShortId) {
     return {
       uid: match.uid,
