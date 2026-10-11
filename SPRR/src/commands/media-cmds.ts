@@ -10,10 +10,12 @@ import {
   run,
   getContacts,
   resolveTarget,
+  captureCommandTarget,
+  confirmCommandTarget,
   getStatePathForBrowser,
   loadAliases,
   buildPrivateCid,
-  detectMyUid,
+  getMyUid,
   cliState,
 } from '../cli/context.js';
 import {
@@ -48,7 +50,7 @@ async function loadContactsWithAliases(
   for (const c of contacts) {
     if (aliases[c.uid]) c.nickname = aliases[c.uid];
   }
-  const myUid = detectMyUid(contacts);
+  const myUid = getMyUid(env);
   return { contacts, myUid };
 }
 
@@ -58,12 +60,15 @@ export function registerMediaCommands(program: Command): void {
     .command('collect-sticker')
     .description('收藏表情贴纸')
     .requiredOption('-m, --msg-id <serverMsgId>', 'sticker 消息的 server_message_id')
-    .option('--to <target>', '目标用户', 'TwT')
+    .option('--to <target>', '目标用户（默认当前会话）')
     .option('--action <n>', '1=收藏, 0=取消', '1')
-    .action(async (opts: { msgId: string; to: string; action: string }) => {
+    .action(async (opts: { msgId: string; to?: string; action: string }) => {
+      const targetSelection = captureCommandTarget(opts.to);
+      if (!targetSelection) { log.error('请指定 --to <用户>，或先用 history 选择当前会话'); return; }
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
         const { contacts, myUid } = await loadContactsWithAliases(env);
-        const target = await resolveTarget(env, opts.to, myUid, contacts);
+        const target = await resolveTarget(env, targetName, myUid, contacts);
         if (!target) {
           log.error(`找不到目标用户: ${opts.to}`);
           return;
@@ -106,13 +111,16 @@ export function registerMediaCommands(program: Command): void {
   program
     .command('video')
     .description('查看视频分享详情')
-    .option('--to <target>', '目标用户', 'TwT')
+    .option('--to <target>', '目标用户（默认当前会话）')
     .option('--aweme-id <id>', '视频 aweme_id')
     .option('--msg-id <serverMsgId>', '从历史视频分享消息中提取 aweme_id')
-    .action(async (opts: { to: string; awemeId?: string; msgId?: string }) => {
+    .action(async (opts: { to?: string; awemeId?: string; msgId?: string }) => {
+      const targetSelection = captureCommandTarget(opts.to);
+      if (!targetSelection) { log.error('请指定 --to <用户>，或先用 history 选择当前会话'); return; }
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
         const { contacts, myUid } = await loadContactsWithAliases(env);
-        const target = await resolveTarget(env, opts.to, myUid, contacts);
+        const target = await resolveTarget(env, targetName, myUid, contacts);
         if (!target) {
           log.error(`找不到目标用户: ${opts.to}`);
           return;

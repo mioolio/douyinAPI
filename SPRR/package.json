@@ -6,7 +6,8 @@
     "build": "tsc",
     "build:v2": "tsc",
     "dev:v2": "tsc && node dist/indexv2.js",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "npm run build && node --experimental-vm-modules --test tests/*.test.mjs"
   },
   "dependencies": {
     "commander": "^15.0.0",

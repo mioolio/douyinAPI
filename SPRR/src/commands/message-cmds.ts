@@ -17,10 +17,18 @@ import {
   getStatePathForBrowser,
   loadAliases,
   buildPrivateCid,
-  detectMyUid,
+  getMyUid,
+  setCurrentConversation,
+  recordContactList,
+  captureCommandTarget,
+  confirmCommandTarget,
+  type CommandTargetSelection,
+  cacheMessages,
+  getCachedMessage,
+  markMessageRecalled,
+  isMessageRecalled,
 } from '../cli/context.js';
 import {
-  listContacts,
   sendMessage,
   sendImage,
   sendSticker,
@@ -28,6 +36,7 @@ import {
   recallMessage,
   getHistoryAll,
   getHistory,
+  getHistoryEx,
   type ContactItem,
   type MessageItem,
   type SendSignContext,
@@ -35,7 +44,7 @@ import {
   type StickerSendInfo,
   type QuoteReplyRef,
 } from '../api/operations.js';
-import { getUserInfoMap, getReadOnceImage, buildImageUrl } from '../api/webapi.js';
+import { getReadOnceImage, buildImageUrl } from '../api/webapi.js';
 import { uploadImage } from '../api/tos.js';
 import { captureSendRequests } from './capture-send.js';
 import {
@@ -49,14 +58,64 @@ const log = createLogger('cmd-message');
 /** 加载联系人并应用别名 */
 async function loadContactsWithAliases(
   env: ReturnType<typeof import('../api/operations.js').envFromSession>,
+  options: { refresh?: boolean; refreshStrangers?: boolean } = {},
+  requireMyUid = true,
 ): Promise<{ contacts: ContactItem[]; myUid: string }> {
-  const contacts = await getContacts(env);
+  const contacts = await getContacts(env, options);
   const aliases = await loadAliases();
   for (const c of contacts) {
     if (aliases[c.uid]) c.nickname = aliases[c.uid];
   }
-  const myUid = detectMyUid(contacts);
+  let myUid = '';
+  try { myUid = getMyUid(env); }
+  catch (error) { if (requireMyUid) throw error; }
   return { contacts, myUid };
+}
+
+/** Resolve the current conversation before any contact request or browser startup. */
+function commandTarget(to?: string, referenceId?: string): CommandTargetSelection | null {
+  const selected = captureCommandTarget(to, referenceId);
+  if (!selected) log.error('未选择会话：请指定 --to <UID/昵称/#序号>，或先运行 history --to <目标>');
+  return selected;
+}
+
+/** Use cached metadata first, then search at most five pages of older history. */
+async function findMessage(
+  env: ReturnType<typeof import('../api/operations.js').envFromSession>,
+  cid: string,
+  shortId: string,
+  myUid: string,
+  serverMsgId: string,
+): Promise<MessageItem | null> {
+  if (isMessageRecalled(env, cid, serverMsgId)) {
+    log.error(`消息已撤回，不能引用: ${serverMsgId}`);
+    return null;
+  }
+  const cached = getCachedMessage(env, serverMsgId, cid);
+  if (cached) return cached.message;
+  let cursor = 0n;
+  const seenCursors = new Set<bigint>();
+  for (let page = 0; page < 5; page++) {
+    const result = await getHistoryEx(env, cid, {
+      conversationShortId: shortId,
+      myUid,
+      limit: 50,
+      cursor,
+      direction: page === 0 ? 3 : 1,
+    });
+    cacheMessages(env, cid, result.messages);
+    if (isMessageRecalled(env, cid, serverMsgId)) {
+      log.error(`消息已撤回，不能引用: ${serverMsgId}`);
+      return null;
+    }
+    const found = getCachedMessage(env, serverMsgId, cid);
+    if (found) return found.message;
+    if (!result.hasMore || !result.messages.length || result.nextCursor === cursor || seenCursors.has(result.nextCursor)) break;
+    seenCursors.add(cursor);
+    cursor = result.nextCursor;
+  }
+  log.error(`未找到 serverMsgId=${serverMsgId} 的消息（最多检查最近 250 条）；可先 history --limit <条数> 加载更早记录`);
+  return null;
 }
 
 export function registerMessageCommands(program: Command): void {
@@ -64,33 +123,11 @@ export function registerMessageCommands(program: Command): void {
   program
     .command('list')
     .description('列出所有会话（联系人）')
-    .action(async () => {
+    .option('--refresh-strangers', '重新检查陌生人会话（仍遵守服务器限流冷却）')
+    .action(async (opts: { refreshStrangers?: boolean }) => {
       await run(async ({ env }) => {
-        const contacts = await listContacts(env);
-        const aliases = await loadAliases();
-        const secUidsToFetch = contacts
-          .filter((c) => c.secUid && c.nickname === '(pending)')
-          .map((c) => c.secUid!) as string[];
-        if (secUidsToFetch.length > 0) {
-          log.info(`list: 批量获取 ${secUidsToFetch.length} 个用户的 nickname...`);
-          const userInfoMap = await getUserInfoMap(env, secUidsToFetch);
-          let resolvedCount = 0;
-          for (const c of contacts) {
-            if (!c.secUid) continue;
-            const info = userInfoMap.get(c.secUid);
-            if (info && info.nickname) {
-              c.nickname = info.nickname;
-              resolvedCount++;
-            } else if (c.nickname === '(pending)') {
-              c.nickname = `(uid:${c.uid.slice(-6)})`;
-            }
-          }
-          log.info(`list: 成功获取 ${resolvedCount}/${secUidsToFetch.length} 个 nickname`);
-        }
-        for (const c of contacts) {
-          if (aliases[c.uid]) c.nickname = aliases[c.uid];
-        }
-        const myUid = detectMyUid(contacts);
+        const { contacts, myUid } = await loadContactsWithAliases(env, { refresh: true, refreshStrangers: opts.refreshStrangers }, false);
+        recordContactList(contacts);
         output(contacts, (data) => {
           log.info(`共 ${C.bold}${data.length}${C.reset} 个会话`);
           if (myUid) log.info(`当前账号 UID: ${C.cyan}${myUid}${C.reset}`);
@@ -106,7 +143,7 @@ export function registerMessageCommands(program: Command): void {
             ]),
           ));
           console.log(divider());
-          log.info(`提示: 使用 rename --uid <uid> --name <昵称> 设置备注名`);
+          log.info(`提示: history --to #<序号> 选择会话；rename --uid <uid> --name <昵称> 设置备注名`);
         });
       });
     });
@@ -116,12 +153,12 @@ export function registerMessageCommands(program: Command): void {
     .command('send')
     .description('向指定用户发送文本消息')
     .option('-t, --text <text>', '消息内容（--dev 模式下可省略）')
-    .option('--to <target>', '目标用户 uid 或昵称', 'TwT')
+    .option('--to <target>', '目标 UID、昵称或 #序号（省略时使用已选择会话）')
     .option('--dev', '开发模式：启动已登录浏览器抓包 /v1/message/send 请求（不实际发送）')
     .option('--out', '抓包结果保存到 data/capture/send/ 目录（与 --dev 配合使用）')
     .option('--native', '使用纯 Node.js 原生发送（需手动签名，可能失败）')
     .option('--show-browser', '显示浏览器窗口（默认无头）')
-    .action(async (opts: { text?: string; to: string; dev?: boolean; out?: boolean; native?: boolean; showBrowser?: boolean }) => {
+    .action(async (opts: { text?: string; to?: string; dev?: boolean; out?: boolean; native?: boolean; showBrowser?: boolean }) => {
       if (opts.dev) {
         log.info(`${C.brightYellow}[开发模式]${C.reset} 启动浏览器抓包 /v1/message/send 请求`);
         log.info(`${C.brightYellow}[开发模式]${C.reset} 忽略 --to 和 --text 参数，请在浏览器中手动发送`);
@@ -151,12 +188,15 @@ export function registerMessageCommands(program: Command): void {
         return;
       }
       const text = opts.text;
+      const targetSelection = commandTarget(opts.to);
+      if (!targetSelection) return;
 
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
         const { contacts, myUid } = await loadContactsWithAliases(env);
-        const target = await resolveTarget(env, opts.to, myUid, contacts);
+        const target = await resolveTarget(env, targetName, myUid, contacts);
         if (!target) {
-          log.error(`找不到目标用户: ${opts.to}`);
+          log.error(`找不到目标用户: ${targetName}`);
           return;
         }
         log.info(`发送给: ${C.cyan}${target.nickname}${C.reset} (uid=${target.uid})`);
@@ -211,11 +251,14 @@ export function registerMessageCommands(program: Command): void {
   program
     .command('recall')
     .description('撤回指定消息')
-    .option('--to <target>', '目标用户', 'TwT')
+    .option('--to <target>', '目标 UID、昵称或 #序号（省略时使用已选择会话）')
     .option('--cid <conversationId>', '直接指定 conversationId')
     .option('--msg-id <serverMsgId>', '指定要撤回的 server_message_id')
-    .action(async (opts: { to: string; cid?: string; msgId?: string }) => {
+    .action(async (opts: { to?: string; cid?: string; msgId?: string }) => {
+      const targetSelection = commandTarget(opts.cid || opts.to);
+      if (!targetSelection) return;
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
         const { contacts, myUid } = await loadContactsWithAliases(env);
         let conversationId: string;
         let conversationShortId: string;
@@ -230,9 +273,9 @@ export function registerMessageCommands(program: Command): void {
           conversationShortId = c.conversationShortId;
           targetLabel = c.nickname || c.uid;
         } else {
-          const target = await resolveTarget(env, opts.to, myUid, contacts);
+          const target = await resolveTarget(env, targetName, myUid, contacts);
           if (!target) {
-            log.error(`找不到目标用户: ${opts.to}`);
+            log.error(`找不到目标用户: ${targetName}`);
             return;
           }
           conversationId = buildPrivateCid(myUid, target.uid);
@@ -249,7 +292,8 @@ export function registerMessageCommands(program: Command): void {
             conversationShortId,
             myUid,
           });
-          const myMsg = messages.find((m) => m.isSelf);
+          cacheMessages(env, conversationId, messages);
+          const myMsg = [...messages].reverse().find((m) => m.isSelf && m.category !== 'recall' && !isMessageRecalled(env, conversationId, m.serverMsgId || ''));
           if (!myMsg || !myMsg.serverMsgId) {
             log.error(`未找到自己发送的消息（最近 ${messages.length} 条内）`);
             return;
@@ -258,6 +302,7 @@ export function registerMessageCommands(program: Command): void {
           log.info(`找到最近一条自己发的消息: serverMsgId=${serverMsgId}`);
         }
         const result = await recallMessage(env, conversationId, serverMsgId, conversationShortId);
+        if (result.success) markMessageRecalled(env, conversationId, serverMsgId);
         output(result, (data) => {
           if (data.success) {
             catBox('撤回成功');
@@ -273,9 +318,12 @@ export function registerMessageCommands(program: Command): void {
     .command('send-image')
     .description('向指定用户发送图片消息')
     .requiredOption('-i, --image <path>', '图片文件路径')
-    .option('--to <target>', '目标用户', 'TwT')
-    .action(async (opts: { image: string; to: string }) => {
+    .option('--to <target>', '目标 UID、昵称或 #序号（省略时使用已选择会话）')
+    .action(async (opts: { image: string; to?: string }) => {
+      const targetSelection = commandTarget(opts.to);
+      if (!targetSelection) return;
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
         let imageBytes: Buffer;
         try {
           imageBytes = await fs.readFile(opts.image);
@@ -285,9 +333,9 @@ export function registerMessageCommands(program: Command): void {
         }
         log.info(`图片: ${opts.image} (${imageBytes.length} 字节)`);
         const { contacts, myUid } = await loadContactsWithAliases(env);
-        const target = await resolveTarget(env, opts.to, myUid, contacts);
+        const target = await resolveTarget(env, targetName, myUid, contacts);
         if (!target) {
-          log.error(`找不到目标用户: ${opts.to}`);
+          log.error(`找不到目标用户: ${targetName}`);
           return;
         }
         log.info(`发送给: ${C.cyan}${target.nickname}${C.reset} (uid=${target.uid})`);
@@ -326,19 +374,29 @@ export function registerMessageCommands(program: Command): void {
   program
     .command('history')
     .description('获取指定会话的聊天记录')
-    .option('--to <target>', '目标用户', 'TwT')
+    .option('--to <target>', '目标 UID、昵称或 #序号（省略时使用已选择会话）')
     .option('--cid <conversationId>', '直接指定 conversationId')
     .option('--limit <count>', '拉取条数', '30')
-    .action(async (opts: { to: string; cid?: string; limit: string }) => {
+    .option('--download-images', '下载普通图片；默认只显示消息元数据')
+    .option('--read-once', '读取并保存阅后即焚图片，会消费一次性查看机会')
+    .action(async (opts: { to?: string; cid?: string; limit: string; downloadImages?: boolean; readOnce?: boolean }) => {
+      const targetSelection = commandTarget(opts.cid || opts.to);
+      if (!targetSelection) return;
+      const limit = Number(opts.limit);
+      if (!/^\d+$/.test(opts.limit) || !Number.isSafeInteger(limit) || limit <= 0) {
+        log.error('--limit 必须是正整数');
+        return;
+      }
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
         const { contacts, myUid } = await loadContactsWithAliases(env);
         let cid = opts.cid;
         let shortId: string | undefined;
         let nickname = '(指定会话)';
         if (!cid) {
-          const target = await resolveTarget(env, opts.to, myUid, contacts);
+          const target = await resolveTarget(env, targetName, myUid, contacts);
           if (!target) {
-            log.error(`找不到目标用户: ${opts.to}`);
+            log.error(`找不到目标用户: ${targetName}`);
             return;
           }
           cid = buildPrivateCid(myUid, target.uid);
@@ -358,7 +416,6 @@ export function registerMessageCommands(program: Command): void {
           log.error(`无法获取 conversation_short_id`);
           return;
         }
-        const limit = parseInt(opts.limit, 10) || 30;
         log.info(`会话: ${C.cyan}${nickname}${C.reset}  cid=${cid}  shortId=${shortId}  limit=${limit}`);
 
         let messages: MessageItem[];
@@ -377,11 +434,15 @@ export function registerMessageCommands(program: Command): void {
           });
         }
 
-        // 图片解密
-        const decodedDir = path.join(DATA_DIR, 'decoded');
-        await fs.mkdir(decodedDir, { recursive: true });
+        cacheMessages(env, cid, messages);
+        const selected = contacts.find((c) => c.conversationId === cid);
+        if (selected) setCurrentConversation(selected);
 
-        async function downloadAndDecrypt(url: string, skey: string, oid: string): Promise<boolean> {
+        // Media access is opt-in; reading one-time images consumes the server-side view.
+        const decodedDir = path.join(DATA_DIR, 'decoded');
+        if (opts.downloadImages || opts.readOnce) await fs.mkdir(decodedDir, { recursive: true });
+
+        async function downloadAndDecrypt(url: string, skey: string | undefined, oid: string): Promise<boolean> {
           try {
             const cipherRes = await fetch(url, {
               headers: { 'user-agent': 'Mozilla/5.0', referer: 'https://www.douyin.com/' },
@@ -391,13 +452,16 @@ export function registerMessageCommands(program: Command): void {
               return false;
             }
             const ciphertext = Buffer.from(await cipherRes.arrayBuffer());
-            const key = Buffer.from(skey, 'hex');
-            const nonce = ciphertext.subarray(0, 12);
-            const tag = ciphertext.subarray(ciphertext.length - 16);
-            const data = ciphertext.subarray(12, ciphertext.length - 16);
-            const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
-            decipher.setAuthTag(tag);
-            const plain = Buffer.concat([decipher.update(data), decipher.final()]);
+            let plain = ciphertext;
+            if (skey) {
+              const key = Buffer.from(skey, 'hex');
+              const nonce = ciphertext.subarray(0, 12);
+              const tag = ciphertext.subarray(ciphertext.length - 16);
+              const data = ciphertext.subarray(12, ciphertext.length - 16);
+              const decipher = crypto.createDecipheriv('aes-256-gcm', key, nonce);
+              decipher.setAuthTag(tag);
+              plain = Buffer.concat([decipher.update(data), decipher.final()]);
+            }
             let ext = 'bin';
             if (plain.length >= 12) {
               if (plain[0] === 0xff && plain[1] === 0xd8) ext = 'jpg';
@@ -416,8 +480,8 @@ export function registerMessageCommands(program: Command): void {
           }
         }
 
-        const plainImages = messages.filter((m) => m.category === 'image' && !m.isEncryptedImage && m.imageSkey);
-        if (plainImages.length > 0) {
+        const plainImages = messages.filter((m) => m.category === 'image' && !m.isEncryptedImage);
+        if (opts.downloadImages && plainImages.length > 0) {
           const withUrl = plainImages.filter((m) => m.stickerUrl);
           const withoutUrl = plainImages.filter((m) => !m.stickerUrl);
           log.info(`检测到 ${plainImages.length} 条普通图片（有URL ${withUrl.length} / 无URL ${withoutUrl.length}），解密下载...`);
@@ -439,8 +503,8 @@ export function registerMessageCommands(program: Command): void {
         }
 
         const encryptedMsgs = messages.filter((m) => m.isEncryptedImage && m.serverMsgId);
-        if (encryptedMsgs.length > 0) {
-          log.info(`检测到 ${encryptedMsgs.length} 条加密图片，尝试解密...`);
+        if (opts.readOnce && encryptedMsgs.length > 0) {
+          log.warn(`正在读取 ${encryptedMsgs.length} 条阅后即焚图片；会消费一次性查看机会`);
           const shortIdStr = String(shortId);
           let decryptedCount = 0;
           let alreadyReadCount = 0;
@@ -491,17 +555,20 @@ export function registerMessageCommands(program: Command): void {
     .description('发送表情贴纸消息')
     .option('-s, --sticker <path>', 'sticker 信息 JSON 文件路径')
     .option('-m, --from-msg <serverMsgId>', '从历史 sticker 消息中提取信息')
-    .option('--to <target>', '目标用户', 'TwT')
-    .action(async (opts: { sticker?: string; fromMsg?: string; to: string }) => {
+    .option('--to <target>', '目标 UID、昵称或 #序号（省略时使用已选择会话）')
+    .action(async (opts: { sticker?: string; fromMsg?: string; to?: string }) => {
       if (!opts.sticker && !opts.fromMsg) {
         log.error(`必须指定 --sticker <path> 或 --from-msg <serverMsgId>`);
         return;
       }
+      const targetSelection = commandTarget(opts.to);
+      if (!targetSelection) return;
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
         const { contacts, myUid } = await loadContactsWithAliases(env);
-        const target = await resolveTarget(env, opts.to, myUid, contacts);
+        const target = await resolveTarget(env, targetName, myUid, contacts);
         if (!target) {
-          log.error(`找不到目标用户: ${opts.to}`);
+          log.error(`找不到目标用户: ${targetName}`);
           return;
         }
         log.info(`发送给: ${C.cyan}${target.nickname}${C.reset} (uid=${target.uid})`);
@@ -509,13 +576,7 @@ export function registerMessageCommands(program: Command): void {
         if (opts.fromMsg) {
           const cid = buildPrivateCid(myUid, target.uid);
           log.info(`查找 sticker 消息: serverMsgId=${opts.fromMsg}`);
-          const messages = await getHistory(env, cid, {
-            direction: 3,
-            limit: 50,
-            conversationShortId: target.conversationShortId,
-            myUid,
-          });
-          const stickerMsg = messages.find((m) => m.serverMsgId === opts.fromMsg);
+          const stickerMsg = await findMessage(env, cid, target.conversationShortId, myUid, opts.fromMsg);
           if (!stickerMsg || stickerMsg.category !== 'sticker') {
             log.error(`未找到 sticker 消息（serverMsgId=${opts.fromMsg}）`);
             return;
@@ -579,38 +640,41 @@ export function registerMessageCommands(program: Command): void {
     .description('引用回复消息')
     .requiredOption('-t, --text <text>', '回复内容')
     .requiredOption('-r, --ref <serverMsgId>', '被引用消息的 server_message_id')
-    .option('--to <target>', '目标用户', 'TwT')
+    .option('--to <target>', '目标 UID、昵称或 #序号（省略时优先使用引用消息的会话）')
     .option('--native', '使用纯 Node.js 原生发送（需手动签名，可能失败）')
     .option('--show-browser', '显示浏览器窗口（默认无头模式）')
-    .action(async (opts: { text: string; ref: string; to: string; native?: boolean; showBrowser?: boolean }) => {
+    .action(async (opts: { text: string; ref: string; to?: string; native?: boolean; showBrowser?: boolean }) => {
+      if (!/^\d+$/.test(opts.ref)) {
+        log.error('--ref 必须是数字消息 ID');
+        return;
+      }
+      const targetSelection = commandTarget(opts.to, opts.ref);
+      if (!targetSelection) return;
       await run(async ({ env }) => {
+        const targetName = confirmCommandTarget(targetSelection);
+        const cachedRef = getCachedMessage(env, opts.ref);
         const { contacts, myUid } = await loadContactsWithAliases(env);
-        const target = await resolveTarget(env, opts.to, myUid, contacts);
+        const target = await resolveTarget(env, targetName, myUid, contacts);
         if (!target) {
-          log.error(`找不到目标用户: ${opts.to}`);
+          log.error(`找不到目标用户: ${targetName}`);
           return;
         }
         const cid = buildPrivateCid(myUid, target.uid);
         const shortId = target.conversationShortId;
-        log.info(`查找被引用消息: serverMsgId=${opts.ref}`);
-        const messages = await getHistory(env, cid, {
-          direction: 3,
-          limit: 50,
-          conversationShortId: shortId,
-          myUid,
-        });
-        const refMsg = messages.find((m) => m.serverMsgId === opts.ref);
-        if (!refMsg) {
-          log.error(`未找到 serverMsgId=${opts.ref} 的消息`);
+        if (cachedRef && cachedRef.cid !== cid) {
+          log.error(`引用消息属于其他会话（${cachedRef.cid}），与 --to 指定的目标不一致`);
           return;
         }
+        log.info(`查找被引用消息: serverMsgId=${opts.ref}`);
+        const refMsg = await findMessage(env, cid, shortId, myUid, opts.ref);
+        if (!refMsg) return;
         log.info(`被引用消息: [${refMsg.category}] ${refMsg.text?.slice(0, 30)}`);
         const ref: QuoteReplyRef = {
           serverMsgId: refMsg.serverMsgId!,
           refmsgType: refMsg.messageType,
           refmsgUid: refMsg.senderId,
           refmsgSecUid: '',
-          refmsgNickname: refMsg.senderLabel === '我' ? '我' : '对方',
+          refmsgNickname: refMsg.isSelf ? '我' : target.nickname,
           refmsgShortText: refMsg.text || '',
           refmsgContent: refMsg.contentJson || '{}',
         };

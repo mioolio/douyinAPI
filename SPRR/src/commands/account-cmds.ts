@@ -4,19 +4,20 @@
 
 import type { Command } from 'commander';
 import fs from 'node:fs/promises';
+import path from 'node:path';
 
 import { createLogger } from '../utils/logger.js';
 import { C, catBox } from '../cli/ui.js';
-import { cliState, clearCache, setCookie, loadAliases, saveAliases } from '../cli/context.js';
+import { cliState, clearCache, setCookie, setSessionSource, getDefaultSessionSource, ensureSession, loadAliases, saveAliases } from '../cli/context.js';
 import {
   listAccounts,
   getCurrentAccount,
   setCurrentAccount,
   deleteAccount,
   validateAccountName,
-  resolveStorageState,
+  accountFile,
 } from '../auth/accounts.js';
-import { loadFromStorageState, sessionFromCookieString } from '../auth/session.js';
+import { sessionFromCookieString } from '../auth/session.js';
 
 const log = createLogger('cmd-account');
 
@@ -34,7 +35,8 @@ export function registerAccountCommands(program: Command): void {
       try {
         const mod = await import('./login.js');
         await mod.loginAccount(name, { timeout, url: opts.url, oc: opts.oc });
-        clearCache();
+        await setSessionSource({});
+        await clearCache();
       } catch (e) {
         log.error('登录失败', e);
       }
@@ -72,7 +74,8 @@ export function registerAccountCommands(program: Command): void {
     .action(async (name: string) => {
       try {
         await setCurrentAccount(name);
-        clearCache();
+        await setSessionSource({});
+        await clearCache();
         catBox(`已切换账号: ${name}`);
       } catch (e) {
         log.error('切换账号失败', e);
@@ -90,7 +93,15 @@ export function registerAccountCommands(program: Command): void {
         return;
       }
       try {
+        const source = getDefaultSessionSource();
+        const deletingDefault = source.account === name ||
+          (Boolean(source.statePath) && path.resolve(source.statePath!) === path.resolve(accountFile(name))) ||
+          (!source.account && !source.cookie && !source.statePath && await getCurrentAccount() === name);
         await deleteAccount(name);
+        if (deletingDefault) {
+          await setSessionSource({});
+          await clearCache();
+        }
         catBox(`已删除账号: ${name}`);
       } catch (e) {
         log.error('删除账号失败', e);
@@ -102,21 +113,17 @@ export function registerAccountCommands(program: Command): void {
     .command('whoami')
     .description('显示当前账号和登录态')
     .action(async () => {
-      const current = await getCurrentAccount();
-      if (!current) {
-        log.info('当前未设置账号（将使用默认兜底）');
-        return;
-      }
-      if (cliState.json) {
-        console.log(JSON.stringify({ current }, null, 2));
-        return;
-      }
-      log.info(`当前账号: ${C.cyan}${current}${C.reset}`);
       try {
-        const { path: statePath } = await resolveStorageState(undefined, current);
-        const session = await loadFromStorageState(statePath);
+        const current = cliState.cookie ? '(直接 Cookie)' : cliState.statePath ? '(指定状态文件)'
+          : cliState.account || await getCurrentAccount() || '(默认兜底)';
+        const { session } = await ensureSession();
         const uid = session.uid || '?';
         const hasSid = Boolean(session.cookies['sessionid']);
+        if (cliState.json) {
+          console.log(JSON.stringify({ current, uid, hasSessionid: hasSid }, null, 2));
+          return;
+        }
+        log.info(`当前账号: ${C.cyan}${current}${C.reset}`);
         log.info(`  uid_tt: ${uid}`);
         log.info(`  sessionid: ${hasSid ? `${C.green}有${C.reset}` : `${C.red}无${C.reset}`}`);
         log.info(`  保存于: ${new Date(session.savedAt).toLocaleString('zh-CN', { hour12: false })}`);
@@ -132,7 +139,7 @@ export function registerAccountCommands(program: Command): void {
     .action(async (cookieStr: string) => {
       try {
         const test = sessionFromCookieString(cookieStr);
-        setCookie(cookieStr);
+        await setCookie(cookieStr);
         const cookieCount = Object.keys(test.cookies).length;
         catBox(`已使用 cookie 字符串登录（${cookieCount} 个 cookie）`);
         log.info(`  uid_tt: ${test.uid || '?'}`);
@@ -156,7 +163,7 @@ export function registerAccountCommands(program: Command): void {
           return;
         }
         const test = sessionFromCookieString(cookieStr);
-        setCookie(cookieStr);
+        await setCookie(cookieStr);
         const cookieCount = Object.keys(test.cookies).length;
         catBox(`已从文件加载 cookie（${cookieCount} 个）`);
         log.info(`  文件: ${filePath}`);

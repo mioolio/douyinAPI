@@ -77,9 +77,14 @@ npx tsx src/indexv2.ts
 ```
 ◆ sprr> login myaccount
 ◆ sprr> list
-◆ sprr> send --to <目标> --text "消息内容"
+◆ sprr> history --to #1
+◆ sprr> send --text "消息内容"
 ◆ sprr> exit
 ```
+
+`history --to <UID/昵称/#序号>` 成功后选定当前会话，提示符显示会话名；后续消息命令可省略 `--to`。尚未选择会话时必须指定目标，重名时请使用 UID 或列表序号。
+
+V2 中 `list` 刷新常规会话及未读状态，同时复用昵称和陌生人查询缓存；限流会保留可用结果并提示查询未完成。引用回复优先复用已加载消息。`history` 默认仅展示消息，下载普通图片需加 `--download-images`，读取一次性图片需加 `--read-once`（会消费查看机会）。默认日志级别为 INFO，排查时使用 `--verbose`。
 
 完整命令参考（含所有参数、AI 自动回复配置、常见问题）见 [clu.md](./clu.md)。
 

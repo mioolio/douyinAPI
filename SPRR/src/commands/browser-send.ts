@@ -29,6 +29,8 @@
 
 import { randomUUID } from 'node:crypto';
 import { createLogger } from '../utils/logger.js';
+import { createBrowserDiagnostics } from '../utils/browser-diagnostics.js';
+import { waitForSignatureReady } from './signature-ready.js';
 import {
   IMAPI_CONSTANTS,
   buildRequest,
@@ -57,9 +59,6 @@ const DEFAULT_UA =
 
 /** 抖音主站 URL（secsdk 在任意 douyin.com 页面都会加载） */
 const DOUYIN_URL = 'https://www.douyin.com/';
-
-/** secsdk 初始化等待时间（毫秒） */
-const SECSDK_WAIT_MS = 5_000;
 
 /** 全局自增 sequence_id */
 let _browserSeq = 20001;
@@ -110,52 +109,61 @@ export class BrowserSender {
     const { chromium } = await import('playwright');
     log.info(`BrowserSender: 启动浏览器 (headless=${this.headless})`);
 
-    this.browser = await chromium.launch({
-      headless: this.headless,
-      args: [
-        '--disable-blink-features=AutomationControlled',
-        '--window-size=1400,900',
-      ],
-    });
+    try {
+      this.browser = await chromium.launch({
+        headless: this.headless,
+        args: [
+          '--disable-blink-features=AutomationControlled',
+          '--window-size=1400,900',
+        ],
+      });
 
-    this.context = await this.browser.newContext({
-      storageState: this.storageStatePath,
-      userAgent: DEFAULT_UA,
-      // headful 模式下 viewport=null 让页面视口跟随窗口大小（全屏化时内容自动适应）
-      // headless 模式下使用固定视口
-      viewport: this.headless ? { width: 1400, height: 900 } : null,
-      screen: { width: 1920, height: 1080 },
-      locale: 'zh-CN',
-    });
+      this.context = await this.browser.newContext({
+        storageState: this.storageStatePath,
+        userAgent: DEFAULT_UA,
+        // headful 模式下 viewport=null 让页面视口跟随窗口大小（全屏化时内容自动适应）
+        // headless 模式下使用固定视口
+        viewport: this.headless ? { width: 1400, height: 900 } : null,
+        screen: { width: 1920, height: 1080 },
+        locale: 'zh-CN',
+      });
 
-    // 反检测
-    await this.context.addInitScript(`
-      Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-    `);
+      // 反检测
+      await this.context.addInitScript(`
+        Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+      `);
 
-    this.page = await this.context.newPage();
+      this.page = await this.context.newPage();
 
-    // 转发浏览器 console
-    this.page.on('console', (msg) => {
-      const type = msg.type();
-      if (type === 'error' || type === 'warning') {
-        log.warn(`[browser:${type}] ${msg.text()}`);
-      }
-    });
-    this.page.on('pageerror', (err) => {
-      log.warn(`[browser:pageerror] ${err.message}`);
-    });
+      const diagnostic = createBrowserDiagnostics(log);
+      this.page.on('console', (msg) => {
+        const type = msg.type();
+        if (type === 'error' || type === 'warning') {
+          diagnostic(type, msg.text());
+        }
+      });
+      this.page.on('pageerror', (err) => {
+        diagnostic('pageerror', err.message);
+      });
 
-    log.info(`BrowserSender: 导航到 ${DOUYIN_URL}`);
-    await this.page.goto(DOUYIN_URL, {
-      waitUntil: 'domcontentloaded',
-      timeout: 60_000,
-    });
+      log.info(`BrowserSender: 导航到 ${DOUYIN_URL}`);
+      await this.page.goto(DOUYIN_URL, {
+        waitUntil: 'domcontentloaded',
+        timeout: 60_000,
+      });
 
-    log.info(`BrowserSender: 等待 secsdk 初始化 (${SECSDK_WAIT_MS}ms)`);
-    await this.page.waitForTimeout(SECSDK_WAIT_MS);
+      log.info('BrowserSender: 检测自动签名 SDK 是否就绪');
+      await waitForSignatureReady(this.page);
 
-    log.info('BrowserSender: 浏览器就绪');
+      log.info('BrowserSender: 浏览器就绪');
+    } catch (error) {
+      await this.close();
+      throw error;
+    }
+  }
+
+  isAlive(): boolean {
+    return Boolean(this.browser?.isConnected() && this.page && !this.page.isClosed());
   }
 
   /** 获取 identity_security_token（带缓存） */
@@ -224,7 +232,7 @@ export class BrowserSender {
     }
 
     log.info(
-      `BrowserSender: token 获取成功 (deviceId=${result.deviceId}, token=${result.token.slice(0, 16)}...)`,
+      'BrowserSender: token 获取成功',
     );
     this.cachedToken = { token: result.token, deviceId: result.deviceId };
     return this.cachedToken;

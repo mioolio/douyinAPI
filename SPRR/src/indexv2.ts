@@ -17,15 +17,17 @@
  *   node dist/indexv2.js
  */
 
-import { Command } from 'commander';
+import { Command, CommanderError } from 'commander';
 import readline from 'node:readline';
 import path from 'node:path';
 import fs from 'node:fs/promises';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
-import { createLogger } from './utils/logger.js';
+import { createLogger, setLogVerbose } from './utils/logger.js';
 import { C, catBox } from './cli/ui.js';
-import { cliState, clearCache } from './cli/context.js';
+import { cliState, clearCache, setSessionSource, applyCommandSessionSource, restoreCommandSessionSource, getCurrentConversation } from './cli/context.js';
+import { CommandQueue } from './cli/command-queue.js';
+import { watchControl, stopWatchOrClose } from './cli/watch-control.js';
 import { closeBrowserSender } from './commands/browser-pool.js';
 import { registerAccountCommands } from './commands/account-cmds.js';
 import { registerMessageCommands } from './commands/message-cmds.js';
@@ -39,30 +41,48 @@ const log = createLogger('cli-v2');
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const MACT_FILE = path.join(__dirname, 'MACT.txt');
+const outputDefaults = { verbose: false, json: false };
+
+function applyOutputState(options: { verbose: boolean; json: boolean }): void {
+  cliState.verbose = options.verbose;
+  cliState.json = options.json;
+  setLogVerbose(options.verbose);
+}
+
+export function setReplOutputDefaults(options: { verbose?: boolean; json?: boolean }): void {
+  if (options.verbose !== undefined) outputDefaults.verbose = options.verbose;
+  if (options.json !== undefined) outputDefaults.json = options.json;
+  applyOutputState(outputDefaults);
+}
 
 // ============================ 命令注册 ============================
 
-function createProgram(): Command {
+export function createProgram(onWatchStart?: () => void): Command {
   const program = new Command();
   program
     .name('sprr')
     .description('抖音私信聊天自动化工具（交互式 V2）')
     .version('0.0.1')
-    .option('--verbose', '输出详细日志（debug 级别）', false)
-    .option('--json', '以 JSON 格式输出结果', false)
+    .option('--verbose', '输出详细日志（debug 级别）', outputDefaults.verbose)
+    .option('--no-verbose', '关闭详细日志')
+    .option('--json', '以 JSON 格式输出结果', outputDefaults.json)
+    .option('--no-json', '使用普通输出格式')
     .option('--state <path>', 'storageState 文件路径', undefined)
     .option('--account <name>', '临时使用指定账号', undefined)
     .option('--cookie <string>', '直接使用 cookie 字符串（优先级最高，无需登录）', undefined)
-    .hook('preAction', () => {
-      const opts = program.opts();
-      cliState.verbose = Boolean(opts.verbose);
-      cliState.json = Boolean(opts.json);
-      if (opts.state) cliState.statePath = opts.state;
-      if (opts.account) cliState.account = opts.account;
-      if (opts.cookie) cliState.cookie = opts.cookie;
-      if (cliState.verbose) {
-        process.env.SPRR_DEBUG = '1';
+    .hook('preAction', async (_command, actionCommand) => {
+      if (actionCommand.name() === 'watch') {
+        watchControl.start();
+        onWatchStart?.();
       }
+      const opts = program.opts();
+      applyOutputState({ verbose: Boolean(opts.verbose), json: Boolean(opts.json) });
+      await applyCommandSessionSource(opts);
+    })
+    .hook('postAction', async () => {
+      watchControl.finish();
+      await restoreCommandSessionSource();
+      applyOutputState(outputDefaults);
     })
     .exitOverride(); // 阻止 commander 调用 process.exit
 
@@ -77,10 +97,29 @@ function createProgram(): Command {
   return program;
 }
 
+/** A line containing only global options changes the REPL defaults. */
+export async function configureReplOptions(args: string[]): Promise<boolean> {
+  if (args.length === 0) return false;
+  const program = createProgram();
+  const parsed = program.parseOptions(args);
+  if (parsed.operands.length || parsed.unknown.length) return false;
+  const opts = program.opts();
+  const explicit = (key: string) => program.getOptionValueSource(key) === 'cli';
+  setReplOutputDefaults({
+    verbose: explicit('verbose') ? Boolean(opts.verbose) : undefined,
+    json: explicit('json') ? Boolean(opts.json) : undefined,
+  });
+  if (explicit('cookie') || explicit('state') || explicit('account')) {
+    await setSessionSource(opts.cookie ? { cookie: opts.cookie }
+      : opts.state ? { statePath: opts.state } : { account: opts.account });
+  }
+  return true;
+}
+
 // ============================ REPL 实现 ============================
 
 /** 解析输入行，支持引号 */
-function parseArgs(line: string): string[] {
+export function parseArgs(line: string): string[] {
   const args: string[] = [];
   let current = '';
   let inQuote = false;
@@ -132,8 +171,9 @@ function printWelcome(): void {
   console.log(C.brightMagenta + C.bold + '  ╚══════════════════════════════════════════════════╝' + C.reset);
   console.log();
   console.log(C.gray + '  输入 help 查看可用命令，输入 exit 退出' + C.reset);
-  console.log(C.gray + '  会话首次加载后缓存，输入 reload 可清除缓存' + C.reset);
-  console.log(C.gray + '  浏览器单例复用：首次 send 后后续命令秒发' + C.reset);
+  console.log(C.gray + '  list 刷新未读状态；昵称与已加载消息复用缓存' + C.reset);
+  console.log(C.gray + '  history --to <用户> 选择当前会话；reload 清除缓存' + C.reset);
+  console.log(C.gray + '  首次发送初始化浏览器，后续发送复用；--verbose 查看诊断' + C.reset);
   console.log(C.gray + '  ──────────────────────────────────────────────────' + C.reset);
   console.log();
 }
@@ -144,7 +184,7 @@ function showHelp(): void {
   console.log(C.brightCyan + C.bold + '可用命令:' + C.reset);
   console.log();
   console.log(C.yellow + '  会话与消息:' + C.reset);
-  console.log('    list                          列出所有会话（联系人）');
+  console.log('    list [--refresh-strangers]    刷新会话列表（陌生人查询遵守限流冷却）');
   console.log('    send --to <用户> -t "消息"    发送文本消息（默认浏览器签名）');
   console.log('      ↳ --native                  纯 Node.js 原生发送（可能失败）');
   console.log('      ↳ --show-browser            显示浏览器窗口');
@@ -153,6 +193,8 @@ function showHelp(): void {
   console.log('    reply --to <用户> -r <msgId> -t "..."  引用回复');
   console.log('    recall --to <用户> [--msg-id ID]  撤回消息');
   console.log('    history --to <用户> [--limit N]  获取聊天记录');
+  console.log('      ↳ --download-images        下载普通图片');
+  console.log('      ↳ --read-once              读取阅后即焚图片，会消耗一次查看机会');
   console.log('    watch [--to <用户>] [--ai]    实时监控新消息（--ai 开启白名单AI自动回复）');
   console.log('    ai [--add <uid>|--del <uid>|--list]  AI白名单管理');
   console.log();
@@ -188,7 +230,8 @@ function showHelp(): void {
   console.log();
   console.log(C.gray + '  选项: 可在任意命令前加 --json（JSON输出）或 --verbose（调试日志）' + C.reset);
   console.log(C.gray + '  示例: --json list' + C.reset);
-  console.log(C.gray + '        send --to TwT -t "你好"' + C.reset);
+  console.log(C.gray + '        send --to #1 -t "你好"    使用最后一次 list 的序号' + C.reset);
+  console.log(C.gray + '  history 选定会话后可省略 --to；重名时请使用 UID 或会话 ID' + C.reset);
   console.log(C.gray + '        history --to "张三" --limit 100' + C.reset);
   console.log();
 }
@@ -215,47 +258,65 @@ async function repl(): Promise<void> {
     },
   });
 
-  rl.prompt();
+  const queue = new CommandQueue();
+  let closing = false;
+  let inputClosed = false;
+  let exitQueued = false;
+  const prompt = () => {
+    if (closing || inputClosed) return;
+    const current = getCurrentConversation();
+    const label = current ? ` [${current.nickname || current.uid}]` : '';
+    rl.setPrompt(`${C.green}${C.bold}◆ sprr${label}> ${C.reset}`);
+    rl.prompt();
+  };
 
-  rl.on('line', async (line: string) => {
+  prompt();
+
+  const executeLine = async (line: string) => {
+    if (closing) return;
     const trimmed = line.trim();
     if (!trimmed) {
-      rl.prompt();
+      prompt();
       return;
     }
 
     // 内置命令
     if (trimmed === 'exit' || trimmed === 'quit') {
       console.log(C.gray + '再见!' + C.reset);
+      closing = true;
       rl.close();
-      // 关闭常驻浏览器单例
-      await closeBrowserSender();
-      process.exit(0);
+      return;
     }
     if (trimmed === 'clear' || trimmed === 'cls') {
       console.clear();
-      rl.prompt();
+      prompt();
       return;
     }
     if (trimmed === 'help' || trimmed === '?') {
       showHelp();
-      rl.prompt();
+      prompt();
       return;
     }
     if (trimmed === 'reload') {
-      clearCache();
+      await clearCache();
       catBox('已清除会话缓存');
-      rl.prompt();
+      prompt();
       return;
     }
 
     // 解析并执行 commander 命令
     try {
       const args = parseArgs(trimmed);
-      const program = createProgram();
-      await program.parseAsync(args, { from: 'user' });
+      if (await configureReplOptions(args)) {
+        catBox('REPL 默认选项已更新');
+      } else {
+        const program = createProgram(() => { if (inputClosed || exitQueued) watchControl.requestStop(); });
+        await program.parseAsync(args, { from: 'user' });
+      }
     } catch (e: unknown) {
-      if (e instanceof Error) {
+      if (e instanceof CommanderError && e.exitCode === 0) {
+        // Help and version output are successful commands.
+      } else if (e instanceof Error) {
         const msg = e.message;
         if (msg.includes('outputHelp') || msg.includes('CommanderError: version')) {
           // 静默
@@ -267,21 +328,61 @@ async function repl(): Promise<void> {
       } else {
         log.error('执行异常', e);
       }
+    } finally {
+      watchControl.finish();
+      await restoreCommandSessionSource();
+      applyOutputState(outputDefaults);
     }
 
     process.exitCode = undefined;
-    rl.prompt();
+    prompt();
+  };
+
+  rl.on('line', (line: string) => {
+    if (/^(?:exit|quit)$/.test(line.trim())) {
+      exitQueued = true;
+      watchControl.requestStop();
+    }
+    void queue.enqueue(() => executeLine(line)).catch((error) => log.error('命令执行失败', error));
   });
 
-  rl.on('close', async () => {
-    await closeBrowserSender();
-    process.exit(0);
+  rl.on('SIGINT', () => stopWatchOrClose(() => rl.close()));
+
+  rl.on('close', () => {
+    inputClosed = true;
+    watchControl.requestStop();
+    void queue.drain().then(async () => {
+      closing = true;
+      await closeBrowserSender();
+      process.exit(0);
+    }).catch((error) => { log.error('退出失败', error); process.exit(1); });
   });
 }
 
 // ============================ 启动 ============================
 
-repl().catch((e) => {
-  log.error('启动失败', e);
-  process.exit(1);
-});
+export async function main(args = process.argv.slice(2)): Promise<void> {
+  try {
+    if (args.length === 0 || await configureReplOptions(args)) {
+      await repl();
+      return;
+    }
+    try {
+      await createProgram().parseAsync(args, { from: 'user' });
+    } finally {
+      watchControl.finish();
+      await restoreCommandSessionSource();
+      applyOutputState(outputDefaults);
+      await closeBrowserSender();
+    }
+  } catch (error) {
+    if (!(error instanceof CommanderError && error.exitCode === 0)) throw error;
+  }
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
+  main().catch((e) => {
+    log.error('启动失败', e);
+    process.exit(1);
+  });
+}

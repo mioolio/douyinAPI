@@ -7,6 +7,7 @@
 
 import type { MessageItem } from '../api/operations.js';
 import { cliState } from './context.js';
+import { stripVTControlCharacters } from 'node:util';
 
 // ============================ 颜色常量 ============================
 
@@ -37,19 +38,23 @@ export function formatMessageLine(m: MessageItem): string {
     ? new Date(m.timestamp).toLocaleString('zh-CN', { hour12: false })
     : '                   ';
   const typeTag = formatCategoryTag(m.category);
-  const sender = m.senderLabel.padEnd(3, ' ');
+  const sender = padDisplay(m.senderLabel, 6);
   let content: string;
   if (m.category === 'video_share') {
     const author = m.videoAuthor ? `作者:${m.videoAuthor} ` : '';
     content = `${author}${m.text || '(无标题)'}`;
   } else if (m.category === 'system_tip') {
-    content = m.text || '(系统提示)';
+    content = cliState.verbose ? (m.text || '(系统提示)') : (m.text?.replace(/\{\{\d+\}\}/g, '').trim() || '(系统提示)');
   } else if (m.category === 'image') {
-    content = m.stickerUrl ? `${m.text || '[图片]'} ${m.stickerUrl}` : (m.text || '[图片]');
+    content = m.text || (m.isEncryptedImage ? '[阅后即焚图片，尚未读取]' : '[图片]');
+    if (cliState.verbose && m.stickerUrl) content += ` ${m.stickerUrl}`;
   } else if (m.category === 'sticker') {
-    content = m.stickerUrl ? `${m.text} ${m.stickerUrl}` : (m.text || '[表情]');
+    content = m.text || '[表情]';
+    if (cliState.verbose && m.stickerUrl) content += ` ${m.stickerUrl}`;
   } else if (m.category === 'recall') {
     content = m.text || '撤回了一条消息';
+  } else if (m.category === 'unknown' && !cliState.verbose) {
+    content = m.text?.startsWith('[未识别消息') ? '[暂不支持的消息]' : (m.text || '[暂不支持的消息]');
   } else {
     content = m.text || '(空消息)';
   }
@@ -59,12 +64,12 @@ export function formatMessageLine(m: MessageItem): string {
 
 export function formatCategoryTag(category: string): string {
   const tag = (s: string, color: string) => `${color}[${s}]${C.reset}`;
-  const pad = (s: string) => s.padEnd(6, ' ');
+  const pad = (s: string) => padDisplay(s, 8);
   switch (category) {
     case 'text':        return tag(pad('文本'), C.white);
-    case 'video_share': return tag('分享视频', C.brightMagenta);
+    case 'video_share': return tag(pad('分享视频'), C.brightMagenta);
     case 'ai_text':     return tag(pad('AI回复'), C.brightBlue);
-    case 'system_tip':  return tag('系统提示', C.gray);
+    case 'system_tip':  return tag(pad('系统提示'), C.gray);
     case 'image':       return tag(pad('图片'), C.brightGreen);
     case 'sticker':     return tag(pad('表情'), C.brightYellow);
     case 'recall':      return tag(pad('撤回'), C.yellow);
@@ -73,14 +78,17 @@ export function formatCategoryTag(category: string): string {
 }
 
 export function formatTable(headers: string[], rows: string[][]): string {
+  const singleLine = (s: string) => s.replace(/[\r\n\t]+/g, ' ');
+  const cells = rows.map((row) => headers.map((_, i) => singleLine(row[i] || '')));
+  const titles = headers.map(singleLine);
   const widths = headers.map((h, i) => {
-    const maxRowLen = Math.max(...rows.map((r) => (r[i] || '').length));
-    return Math.max(h.length, maxRowLen);
+    const maxRowLen = Math.max(0, ...cells.map((r) => visualWidth(r[i])));
+    return Math.max(visualWidth(h), maxRowLen);
   });
-  const pad = (s: string, i: number) => (s || '').padEnd(widths[i]);
-  const sep = '─'.repeat(widths.reduce((a, b) => a + b + 3, 0));
-  const headerLine = headers.map(pad).join(' │ ');
-  const rowLines = rows.map((r) => r.map(pad).join(' │ '));
+  const pad = (s: string, i: number) => padDisplay(s, widths[i]);
+  const sep = '─'.repeat(widths.reduce((a, b) => a + b, 0) + Math.max(0, widths.length - 1) * 3);
+  const headerLine = titles.map(pad).join(' │ ');
+  const rowLines = cells.map((r) => r.map(pad).join(' │ '));
   return [headerLine, sep, ...rowLines].join('\n');
 }
 
@@ -115,9 +123,38 @@ export function divider(char = '─', len = 80, color = C.gray): string {
   return color + char.repeat(len) + C.reset;
 }
 
-/** 剥离 ANSI 颜色码，计算字符串可视宽度 */
+const graphemeSegments = new Intl.Segmenter(undefined, { granularity: 'grapheme' });
+
+function isWide(point: number): boolean {
+  return point >= 0x1100 && (
+    point <= 0x115f || point === 0x2329 || point === 0x232a ||
+    (point >= 0x2e80 && point <= 0xa4cf && point !== 0x303f) ||
+    (point >= 0xac00 && point <= 0xd7a3) || (point >= 0xf900 && point <= 0xfaff) ||
+    (point >= 0xfe10 && point <= 0xfe19) || (point >= 0xfe30 && point <= 0xfe6f) ||
+    (point >= 0xff00 && point <= 0xff60) || (point >= 0xffe0 && point <= 0xffe6) ||
+    (point >= 0x1b000 && point <= 0x1b2ff) || (point >= 0x20000 && point <= 0x3fffd)
+  );
+}
+
+/** Terminal columns: ignore ANSI and combining marks; CJK and emoji occupy two. */
 export function visualWidth(s: string): number {
-  return s.replace(/\x1b\[[0-9;]*m/g, '').length;
+  let width = 0;
+  for (const { segment } of graphemeSegments.segment(stripVTControlCharacters(s))) {
+    if (/\p{Emoji_Presentation}|\u20e3/u.test(segment) ||
+        (/\p{Extended_Pictographic}/u.test(segment) && segment.includes('\uFE0F'))) {
+      width += 2;
+      continue;
+    }
+    for (const char of segment) {
+      if (/[\p{Mark}\p{Format}\p{Control}]/u.test(char)) continue;
+      width += isWide(char.codePointAt(0)!) ? 2 : 1;
+    }
+  }
+  return width;
+}
+
+function padDisplay(s: string, width: number): string {
+  return s + ' '.repeat(Math.max(0, width - visualWidth(s)));
 }
 
 /**

@@ -68,6 +68,8 @@
 
 本项目推荐使用 **V2 交互式 REPL** 入口（`src/indexv2.ts`）：启动后进入交互式提示符 `◆ sprr> `，执行完命令不退出，可继续输入下一条命令，会话/联系人自动缓存复用。
 
+V2 的目标可以是 UID、昵称、会话 ID 或最近一次 `list` 显示的 `#序号`。成功执行 `history --to <目标>` 后，该会话成为当前会话，提示符显示会话名；消息命令可省略 `--to`。未选择会话时需明确指定目标，重名会提示候选 UID。切换账号或 `reload` 会清除会话选择和缓存。
+
 ### 1. 开发模式（推荐，无需编译）
 
 ```bash
@@ -126,6 +128,10 @@ sprr [--verbose] [--json] [--state <path>] [--account <name>] [--cookie <string>
 | `--state <path>` | 指定 storageState 文件路径（优先级最高） |
 | `--account <name>` | 临时使用指定账号，不修改当前账号指针 |
 | `--cookie <string>` | 直接使用 cookie 字符串（优先级最高，无需登录） |
+
+启动 REPL 时传入的登录来源选项设为本次进程的默认来源；在 REPL 的某条命令上使用这些选项只覆盖该命令，执行后恢复默认。需要持续切换时使用 `use <name>`、`cookie <string>` 或 `cookie-file <path>`。优先级为 `--cookie`、`--state`、`--account`；切换来源会等待旧浏览器关闭。
+
+日志默认 INFO；`--verbose` 开启 DEBUG（包括浏览器诊断），显式设置 `SPRR_LOG_LEVEL` 时以环境变量为准。启动参数或 REPL 单独输入的 `--verbose`、`--json` 设置后续默认；`--no-verbose`、`--no-json` 关闭，某条命令携带的选项只覆盖该命令。浏览器启动等待实际 SDK 加签就绪，已有登录态用轻量 IM 请求验证；限流或网络错误会提示暂时无法确认，并保留登录信息。
 
 **示例：**
 
@@ -252,13 +258,15 @@ sprr cookie-file <path>
 
 ### `list` - 列出会话
 
-列出所有会话（联系人），自动批量获取昵称。按最近消息时间排序，最多拉取 500 个会话（抖音接口限制）。
+列出会话（联系人），自动批量获取昵称。按最近消息时间排序，常规会话最多拉取 40 页、2000 条。
 
 ```bash
-sprr list
+sprr list [--refresh-strangers]
 ```
 
 **输出字段：** 序号 / 昵称 / UID / 未读数 / 会话 ID
+
+每次 `list` 刷新常规会话及未读状态，后续命令在 30 秒内复用；陌生人会话单独缓存 60 秒，昵称缓存 30 分钟。`--refresh-strangers` 主动检查陌生人会话，但仍遵守限流冷却。限流采用逐步延长的重试间隔，失败会保留已获得数据并提示查询未完成，不能据此认定没有会话。缓存仅在当前进程中使用。
 
 ---
 
@@ -282,14 +290,16 @@ sprr rename --uid <uid> --name <昵称>
 获取指定会话的聊天记录，支持分页拉取大量历史。
 
 ```bash
-sprr history [--to <target>] [--cid <conversationId>] [--limit <count>]
+sprr history [--to <target>] [--cid <conversationId>] [--limit <count>] [--download-images] [--read-once]
 ```
 
 | 选项 | 必填 | 说明 |
 |------|------|------|
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 | `--cid` | 否 | 直接指定会话 ID（优先于 `--to`） |
 | `--limit` | 否 | 拉取条数，默认 30，可设为 500/1000 拉取更多 |
+| `--download-images` | 否 | 下载并保存普通图片，默认不下载 |
+| `--read-once` | 否 | 读取并保存阅后即焚图片，会消费一次性查看机会，默认不读取 |
 
 **输出字段（每条消息）：** 时间 / 类型标签 / 发送方（我/对方/服务器） / 内容 / serverMsgId
 
@@ -298,6 +308,8 @@ sprr history [--to <target>] [--cid <conversationId>] [--limit <count>]
 **示例：**
 
 ```
+◆ sprr> list
+◆ sprr> history --to #1
 ◆ sprr> history
 ◆ sprr> history --to TwT --limit 100
 ◆ sprr> history --cid "0:1:xxx:xxx" --limit 500
@@ -316,7 +328,7 @@ sprr send -t <text> [--to <target>] [--native] [--show-browser]
 | 选项 | 必填 | 说明 |
 |------|------|------|
 | `-t, --text` | 是 | 消息内容 |
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 | `--native` | 否 | 使用纯 Node.js 原生发送（需手动签名，可能失败） |
 | `--show-browser` | 否 | 显示浏览器窗口（默认无头模式） |
 
@@ -333,7 +345,7 @@ sprr send-image -i <path> [--to <target>]
 | 选项 | 必填 | 说明 |
 |------|------|------|
 | `-i, --image` | 是 | 图片文件路径 |
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 
 ---
 
@@ -347,7 +359,7 @@ sprr recall [--to <target>] [--cid <conversationId>] [--msg-id <serverMsgId>]
 
 | 选项 | 必填 | 说明 |
 |------|------|------|
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 | `--cid` | 否 | 直接指定会话 ID（优先于 `--to`） |
 | `--msg-id` | 否 | 指定撤回的 server_message_id，不指定则取最近一条自己发的消息 |
 
@@ -357,6 +369,8 @@ sprr recall [--to <target>] [--cid <conversationId>] [--msg-id <serverMsgId>]
 
 引用指定消息进行回复。
 
+优先复用已加载消息的完整引用信息（缓存 5 分钟），省略 `--to` 时优先使用该引用所属会话，再使用当前会话。显式目标与引用所属会话不一致时停止。缓存未命中时最多检查最近 5 页、250 条消息；更早的消息可先用 `history --limit <条数>` 加载。已知撤回消息不能再引用。
+
 ```bash
 sprr reply -t <text> -r <serverMsgId> [--to <target>]
 ```
@@ -365,7 +379,7 @@ sprr reply -t <text> -r <serverMsgId> [--to <target>]
 |------|------|------|
 | `-t, --text` | 是 | 回复内容 |
 | `-r, --ref` | 是 | 被引用消息的 server_message_id |
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 
 ---
 
@@ -385,7 +399,7 @@ sprr send-sticker -s <path> [--to <target>]
 |------|------|------|
 | `-s, --sticker` | 否 | sticker 信息 JSON 文件路径 |
 | `-m, --from-msg` | 否 | 从历史 sticker 消息中提取信息 |
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 
 > 必须指定 `--sticker` 或 `--from-msg` 之一。
 
@@ -733,7 +747,7 @@ sprr video [--to <target>] [--aweme-id <id>] [--msg-id <serverMsgId>]
 
 | 选项 | 必填 | 说明 |
 |------|------|------|
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 | `--aweme-id` | 否 | 视频 aweme_id（直接指定，优先于 `--msg-id`） |
 | `--msg-id` | 否 | 从历史视频分享消息中提取 aweme_id |
 
@@ -754,7 +768,7 @@ sprr collect-sticker -m <serverMsgId> [--to <target>] [--action <n>]
 | 选项 | 必填 | 说明 |
 |------|------|------|
 | `-m, --msg-id` | 是 | sticker 消息的 server_message_id |
-| `--to` | 否 | 目标用户 UID 或昵称，默认 `TwT` |
+| `--to` | 否 | 目标 UID、昵称或 #序号；省略时使用当前会话，未选择时必须指定 |
 | `--action` | 否 | 1=收藏（默认），0=取消收藏 |
 
 > 此命令使用 a_bogus 签名。

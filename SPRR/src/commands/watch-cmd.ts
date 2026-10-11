@@ -23,12 +23,13 @@ import {
   getStatePathForBrowser,
   loadAliases,
   buildPrivateCid,
-  detectMyUid,
+  getMyUid,
 } from '../cli/context.js';
 import { connectFrontier, type FrontierFrame } from '../api/frontier.js';
 import { extractWsAccessKey } from './extract-ws-key.js';
 import { getBrowserSender } from './browser-pool.js';
 import { runPollingWatch } from './poll-watch.js';
+import { watchControl, waitForWatchStop } from '../cli/watch-control.js';
 import {
   handleIncomingMessageViaHistory,
   refreshWhitelist,
@@ -98,13 +99,21 @@ export function registerWatchCommands(program: Command): void {
       interval: string;
       ai: boolean;
     }) => {
+      if (watchControl.stopRequested) return;
       await run(async ({ env, session }) => {
         const contacts = await getContacts(env);
+        if (watchControl.stopRequested) return;
+        const pendingReplies = new Set<Promise<void>>();
+        const trackReply = (reply: Promise<unknown>) => {
+          const tracked = reply.catch((error) => { log.error('[AI回复] 异常', error); })
+            .then(() => undefined).finally(() => { pendingReplies.delete(tracked); });
+          pendingReplies.add(tracked);
+        };
         const aliases = await loadAliases();
         for (const c of contacts) {
           if (aliases[c.uid]) c.nickname = aliases[c.uid];
         }
-        const myUid = detectMyUid(contacts);
+        const myUid = getMyUid(env);
         if (!myUid) {
           log.error('无法识别当前账号 UID');
           return;
@@ -164,36 +173,37 @@ export function registerWatchCommands(program: Command): void {
           let usedPoolBrowser = false;
           if (opts.ai) {
             usedPoolBrowser = await setupAi();
-            await checkUnread();
+            if (!watchControl.stopRequested) await checkUnread();
           }
           console.log(divider());
-          await runPollingWatch({
-            env,
-            myUid,
-            intervalMs: Number(opts.interval) || 3000,
-            onMessage: (m) => {
-              if (targetCid && m.conversationId !== targetCid) return;
-              const nickname = cidToNickname.get(m.conversationId) || '(未知会话)';
-              const who = m.message.isSelf ? '我' : '对方';
-              log.info(
-                `${C.brightGreen}[新消息]${C.reset} ${nickname} | ${who}: ${m.message.text || '(非文本消息)'}`,
-              );
-              log.debug(
-                `[watch调试] msgType=${m.message.messageType} cid=${m.conversationId} sender=${m.message.senderId} isSelf=${m.message.isSelf}`,
-              );
-              // 自己/AI 发的消息不触发回复（ai-reply 内部也会按 history isSelf 兜底）
-              if (opts.ai && !m.message.isSelf && !m.message.isFromRobot) {
-                handleIncomingMessageViaHistory(m.conversationId, myUid, contacts, env).catch(
-                  (e) => {
-                    log.error(`[AI回复] 异常: ${e}`);
-                  },
+          try {
+            await runPollingWatch({
+              env,
+              myUid,
+              intervalMs: Number(opts.interval) || 3000,
+              onMessage: (m) => {
+                if (watchControl.stopRequested) return;
+                if (targetCid && m.conversationId !== targetCid) return;
+                const nickname = cidToNickname.get(m.conversationId) || '(未知会话)';
+                const who = m.message.isSelf ? '我' : '对方';
+                log.info(
+                  `${C.brightGreen}[新消息]${C.reset} ${nickname} | ${who}: ${m.message.text || '(非文本消息)'}`,
                 );
-              }
-            },
-          });
-          // 循环结束（Ctrl+C），仅解除 ai-reply 引用，不关闭浏览器（留在单例池）
-          if (usedPoolBrowser) {
-            setBrowserSender(null);
+                log.debug(
+                  `[watch调试] msgType=${m.message.messageType} cid=${m.conversationId} sender=${m.message.senderId} isSelf=${m.message.isSelf}`,
+                );
+                // 自己/AI 发的消息不触发回复（ai-reply 内部也会按 history isSelf 兜底）
+                if (opts.ai && !m.message.isSelf && !m.message.isFromRobot) {
+                  trackReply(handleIncomingMessageViaHistory(m.conversationId, myUid, contacts, env));
+                }
+              },
+            });
+          } finally {
+            await Promise.allSettled([...pendingReplies]);
+            // 解除引用前等完在途回复，账号还原不能提前关闭发送浏览器。
+            if (usedPoolBrowser) {
+              setBrowserSender(null);
+            }
           }
           return;
         }
@@ -219,7 +229,7 @@ export function registerWatchCommands(program: Command): void {
         let usedPoolBrowser = false;
         if (opts.ai) {
           usedPoolBrowser = await setupAi();
-          await checkUnread();
+          if (!watchControl.stopRequested) await checkUnread();
         }
         console.log(divider());
 
@@ -241,20 +251,8 @@ export function registerWatchCommands(program: Command): void {
             log.error('[watch] WebSocket 错误', err);
           },
         });
-        // watch 模式下 Ctrl+C 关闭连接返回 REPL
-        const onSigInt = async () => {
-          console.log();
-          log.info(`${C.yellow}[watch]${C.reset} 正在关闭连接...`);
-          conn.close();
-          // 仅解除 ai-reply 引用，不关闭浏览器（留在单例池供后续 send/reply 复用）
-          if (usedPoolBrowser) {
-            setBrowserSender(null);
-          }
-          process.removeListener('SIGINT', onSigInt);
-        };
-        process.on('SIGINT', onSigInt);
-
         function handleFrame(frame: FrontierFrame): void {
+          if (watchControl.stopRequested) return;
           if (opts.raw) {
             log.info(`[raw] msgId=${frame.msgId} ts=${frame.serverTimestamp}`);
             return;
@@ -282,11 +280,15 @@ export function registerWatchCommands(program: Command): void {
           log.info(`${C.brightGreen}[新消息]${C.reset} ${nickname} | 推送: ${text}`);
           log.debug(`[watch调试] direction=${p.direction} msgType=${p.msgType} cid=${cid} myUid=${myUid}`);
           if (opts.ai) {
-            handleIncomingMessageViaHistory(cid, myUid, contacts, env).catch((e) => {
-              log.error(`[AI回复] 异常: ${e}`);
-            });
+            trackReply(handleIncomingMessageViaHistory(cid, myUid, contacts, env));
           }
         }
+        await waitForWatchStop(async () => {
+          log.info(`${C.yellow}[watch]${C.reset} 正在关闭连接...`);
+          conn.close();
+          await Promise.allSettled([...pendingReplies]);
+          if (usedPoolBrowser) setBrowserSender(null);
+        });
       });
     });
 }
