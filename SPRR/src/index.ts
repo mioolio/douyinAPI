@@ -82,6 +82,7 @@ import { uploadImage } from './api/tos.js';
 import { connectFrontier, type FrontierFrame } from './api/frontier.js';
 import { extractWsAccessKey, watchFrontierViaBrowser } from './commands/extract-ws-key.js';
 import { autoExtractTicketGuard } from './commands/ticket-guard-auto.js';
+import { executeCommentCommand, type CommentCommandOptions } from './commands/media-cmds.js';
 
 const log = createLogger('cli');
 
@@ -139,7 +140,8 @@ program
   .command('login <name>')
   .description('启动浏览器扫码登录抖音，保存为指定账号（自动设为当前账号）')
   .option('--timeout <ms>', '登录超时毫秒数（默认 300000 = 5 分钟）', '300000')
-  .action(async (name: string, opts: { timeout: string }) => {
+  .option('--oc', '强制重新扫码登录（不校验/复用旧登录态）', false)
+  .action(async (name: string, opts: { timeout: string; oc?: boolean }) => {
     validateAccountName(name);
     const timeout = parseInt(opts.timeout, 10);
     // 动态导入 playwright，避免未安装时其他命令也加载失败
@@ -153,7 +155,7 @@ program
       return;
     }
     try {
-      await loginFn(name, { timeout });
+      await loginFn(name, { timeout, oc: opts.oc });
     } catch (e) {
       log.error('登录失败', e);
       process.exitCode = 1;
@@ -1525,125 +1527,18 @@ program
 
 program
   .command('comment')
-  .description('发布评论或回复评论（自动从 data/ticket-guard.json 加载 bd-ticket-guard-* 和 x-tt-session-dtrait 三头；也可手动指定）')
+  .description('发布评论或回复（默认由浏览器在当前会话内自动签名）')
   .requiredOption('--aweme-id <id>', '目标视频 aweme_id')
   .requiredOption('--text <content>', '评论内容')
-  .option('--reply-id <cid>', '被回复评论 cid（不传则发布顶级评论）')
-  .option('--at-uid <uid>', '@用户 uid（可多个，逗号分隔）')
-  .option('--at-sec-uid <sec_uid>', '@用户 sec_uid（与 at-uid 一一对应，逗号分隔）')
-  .option('--ticket-guard-client-data <v>', 'bd-ticket-guard-client-data 头值（手动指定，优先于配置文件）')
-  .option('--ticket-guard-ree-public-key <v>', 'bd-ticket-guard-ree-public-key 头值（手动指定）')
-  .option('--tt-session-dtrait <v>', 'x-tt-session-dtrait 头值（手动指定）')
-  .action(async (opts: {
-    awemeId: string;
-    text: string;
-    replyId?: string;
-    atUid?: string;
-    atSecUid?: string;
-    ticketGuardClientData?: string;
-    ticketGuardReePublicKey?: string;
-    ttSessionDtrait?: string;
-  }) => {
-    await run(async ({ env, session }) => {
-      // 1. 优先使用 CLI 手动指定的三头
-      let ticketGuard: TicketGuardHeaders;
-      if (opts.ticketGuardClientData && opts.ticketGuardReePublicKey && opts.ttSessionDtrait) {
-        ticketGuard = {
-          clientData: opts.ticketGuardClientData,
-          reePublicKey: opts.ticketGuardReePublicKey,
-          sessionDtrait: opts.ttSessionDtrait,
-        };
-        log.info('comment: 使用 CLI 手动指定的 ticket-guard 三头');
-      } else {
-        // 2. 自动从 data/ticket-guard.json 加载（不存在则尝试从抓包数据提取）
-        let cfg = await loadOrExtractTicketGuard(false);
-        // 3. 若加载失败，自动启动浏览器获取（headless，用户无感）
-        if (!cfg) {
-          log.info('comment: 未找到已保存的 ticket-guard 配置，自动启动浏览器获取...');
-          log.info('comment: 浏览器将以无头模式运行，无需手动操作');
-          const { path: statePath } = await resolveStorageState(globalState, globalAccount);
-          const autoCfg = await autoExtractTicketGuard(statePath, { headless: true });
-          if (autoCfg) {
-            await saveTicketGuard(autoCfg);
-            cfg = autoCfg;
-            log.info('comment: 浏览器自动获取三头成功，已保存到 data/ticket-guard.json');
-          } else {
-            log.error('comment: 浏览器自动获取三头失败');
-            log.error('  方式1: 运行 `sprr ticket-guard --auto` 单独尝试浏览器自动获取');
-            log.error('  方式2: 运行 `sprr ticket-guard --from-capture` 从抓包数据提取');
-            log.error('  方式3: 运行 `sprr ticket-guard --client-data ... --ree-public-key ... --session-dtrait ...` 手动导入');
-            log.error('  方式4: 在 comment 命令中直接指定 --ticket-guard-client-data / --ticket-guard-ree-public-key / --tt-session-dtrait');
-            process.exitCode = 1;
-            return;
-          }
-        }
-        if (isTicketGuardExpired(cfg)) {
-          log.warn(
-            `comment: ticket-guard 配置可能已过期（抓包于 ${new Date(cfg.capturedAt).toLocaleString('zh-CN', { hour12: false })}），如发布失败请运行 sprr ticket-guard --auto 重新获取`,
-          );
-        }
-        ticketGuard = {
-          clientData: cfg.clientData,
-          reePublicKey: cfg.reePublicKey,
-          sessionDtrait: cfg.sessionDtrait,
-        };
-        log.info(`comment: 使用配置文件中的 ticket-guard 三头（来源: ${cfg.capturedFrom}）`);
-      }
-
-      // 构造 text_extra（@用户元数据）
-      let textExtra: Array<{ user_id: string; sec_uid: string; type: number; start: number; end: number }> = [];
-      if (opts.atUid && opts.atSecUid) {
-        const uids = opts.atUid.split(',').map((s) => s.trim()).filter(Boolean);
-        const secUids = opts.atSecUid.split(',').map((s) => s.trim()).filter(Boolean);
-        if (uids.length !== secUids.length) {
-          log.error('--at-uid 和 --at-sec-uid 数量不一致');
-          process.exitCode = 1;
-          return;
-        }
-        // 计算 @ 用户在 text 中的位置（简化：按 @nickname 顺序查找；如未找到则位置填 0）
-        let searchStart = 0;
-        for (let i = 0; i < uids.length; i++) {
-          const atText = `@${i + 1}`; // 简化占位符，实际应匹配 @nickname
-          const idx = opts.text.indexOf(atText, searchStart);
-          const start = idx >= 0 ? idx : 0;
-          const end = idx >= 0 ? idx + atText.length : 0;
-          textExtra.push({
-            user_id: uids[i],
-            sec_uid: secUids[i],
-            type: 0,
-            start,
-            end,
-          });
-          if (idx >= 0) searchStart = end;
-        }
-      }
-
-      const result = await publishComment(
-        env,
-        {
-          awemeId: opts.awemeId,
-          text: opts.text,
-          replyId: opts.replyId,
-          textExtra,
-        },
-        ticketGuard,
-      );
-      if (!result.success) {
-        log.error(`评论发布失败: aweme_id=${opts.awemeId} reply=${opts.replyId || '(top)'}`);
-        if (globalJson && result.raw) {
-          console.log(JSON.stringify({ success: false, raw: result.raw }, null, 2));
-        }
-        process.exitCode = 1;
-        return;
-      }
-      if (globalJson) {
-        console.log(JSON.stringify({ success: true, commentId: result.commentId }, null, 2));
-        return;
-      }
-      log.info(`评论发布成功: cid=${result.commentId}`);
-      log.info(`  aweme_id=${opts.awemeId}`);
-      log.info(`  reply_id=${opts.replyId || '(top-level)'}`);
-      log.info(`  text=${opts.text}`);
+  .option('--reply-id <cid>', '被回复评论 cid，0 表示顶级评论')
+  .option('--at-uid <uid>', '@用户 uid（多个用逗号分隔，正文使用 @1、@2 占位符）')
+  .option('--at-sec-uid <sec_uid>', '@用户 sec_uid（与 uid 一一对应）')
+  .option('--ticket-guard-client-data <v>', '手动 bd-ticket-guard-client-data（须同时提供三头）')
+  .option('--ticket-guard-ree-public-key <v>', '手动 bd-ticket-guard-ree-public-key')
+  .option('--tt-session-dtrait <v>', '手动 x-tt-session-dtrait')
+  .action(async (opts: CommentCommandOptions) => {
+    await run(async ({ env }) => {
+      await executeCommentCommand(opts, { env, json: globalJson, getStatePath: getStatePathForBrowser });
     });
   });
 

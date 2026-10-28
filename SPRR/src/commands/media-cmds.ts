@@ -25,21 +25,109 @@ import {
   publishComment,
   collectSticker,
   type CommentInfo,
+  type PublishCommentOptions,
+  type PublishCommentResult,
   type TicketGuardHeaders,
 } from '../api/webapi.js';
 import {
   getHistory,
   type ContactItem,
 } from '../api/operations.js';
-import {
-  loadOrExtractTicketGuard,
-  saveTicketGuard,
-  isTicketGuardExpired,
-  type TicketGuardConfig,
-} from '../crypto/ticket-guard.js';
-import { autoExtractTicketGuard } from './ticket-guard-auto.js';
+import { publishCommentViaBrowser } from './browser-comment.js';
 
 const log = createLogger('cmd-media');
+
+export interface CommentCommandOptions {
+  awemeId: string;
+  text: string;
+  replyId?: string;
+  atUid?: string;
+  atSecUid?: string;
+  ticketGuardClientData?: string;
+  ticketGuardReePublicKey?: string;
+  ttSessionDtrait?: string;
+}
+
+/** V1/V2 share validation, transport selection, and publish-result handling. */
+export async function executeCommentCommand(
+  opts: CommentCommandOptions,
+  context: {
+    env: Parameters<typeof publishComment>[0];
+    json: boolean;
+    getStatePath: () => Promise<string>;
+  },
+): Promise<void> {
+  let result: PublishCommentResult;
+  let publishing = false;
+  try {
+    if (!/^[1-9]\d*$/.test(opts.awemeId)) throw new Error('--aweme-id 必须是有效的数字视频 ID');
+    if (!opts.text.trim()) throw new Error('--text 评论内容不能为空');
+    if (opts.replyId !== undefined && !/^\d+$/.test(opts.replyId)) {
+      throw new Error('--reply-id 必须是数字评论 ID，顶级评论可省略或传 0');
+    }
+    const manualValues = [opts.ticketGuardClientData, opts.ticketGuardReePublicKey, opts.ttSessionDtrait];
+    const hasManual = manualValues.some((value) => value !== undefined);
+    if (hasManual && !manualValues.every((value) => value?.trim())) {
+      throw new Error('手动签名必须同时提供 --ticket-guard-client-data、--ticket-guard-ree-public-key 和 --tt-session-dtrait');
+    }
+    const textExtra: NonNullable<PublishCommentOptions['textExtra']> = [];
+    if (opts.atUid !== undefined || opts.atSecUid !== undefined) {
+      if (!opts.atUid?.trim() || !opts.atSecUid?.trim()) {
+        throw new Error('--at-uid 和 --at-sec-uid 必须成对提供');
+      }
+      const uids = opts.atUid.split(',').map((value) => value.trim());
+      const secUids = opts.atSecUid.split(',').map((value) => value.trim());
+      if (uids.length !== secUids.length || uids.some((value) => !/^\d+$/.test(value)) || secUids.some((value) => !value)) {
+        throw new Error('--at-uid 和 --at-sec-uid 必须一一对应，uid 为数字且所有值不能为空');
+      }
+      let searchStart = 0;
+      for (let i = 0; i < uids.length; i++) {
+        const placeholder = `@${i + 1}`;
+        const match = new RegExp(`${placeholder}(?!\\d)`).exec(opts.text.slice(searchStart));
+        if (!match) throw new Error(`评论内容缺少 @ 用户占位符 ${placeholder}，请按 @1、@2 的顺序填写`);
+        const start = searchStart + match.index;
+        const end = start + placeholder.length;
+        textExtra.push({ user_id: uids[i], sec_uid: secUids[i], type: 0, start, end });
+        searchStart = end;
+      }
+    }
+    const publishOpts: PublishCommentOptions = {
+      awemeId: opts.awemeId, text: opts.text, replyId: opts.replyId, textExtra,
+    };
+    if (hasManual) {
+      publishing = true;
+      result = await publishComment(context.env, publishOpts, {
+        clientData: opts.ticketGuardClientData!,
+        reePublicKey: opts.ticketGuardReePublicKey!,
+        sessionDtrait: opts.ttSessionDtrait!,
+      });
+    } else {
+      const statePath = await context.getStatePath();
+      publishing = true;
+      result = await publishCommentViaBrowser(statePath, publishOpts);
+    }
+  } catch (error) {
+    result = {
+      success: false,
+      reason: error instanceof Error ? error.message : String(error),
+      outcome: publishing ? 'unknown' : 'rejected',
+    };
+  }
+  if (!result.success) {
+    const detail = result.reason || '服务端未确认评论发布成功';
+    log.error(`评论发布失败: ${detail}`);
+    if (result.outcome === 'unknown') log.warn('发布结果未知，请先检查评论是否已发出，避免重复发布');
+    if (context.json) console.log(JSON.stringify({ ...result, reason: detail }, null, 2));
+    process.exitCode = 1;
+    return;
+  }
+  if (context.json) {
+    console.log(JSON.stringify({ success: true, commentId: result.commentId }, null, 2));
+    return;
+  }
+  catBox('评论发布成功');
+  log.info(`  cid: ${C.gray}${result.commentId}${C.reset}`);
+}
 
 /** 加载联系人并应用别名 */
 async function loadContactsWithAliases(
@@ -273,83 +361,18 @@ export function registerMediaCommands(program: Command): void {
   /* --------------------------- comment --------------------------- */
   program
     .command('comment')
-    .description('发布评论或回复评论')
+    .description('发布评论或回复（默认由浏览器在当前会话内自动签名）')
     .requiredOption('--aweme-id <id>', '目标视频 aweme_id')
     .requiredOption('--text <content>', '评论内容')
-    .option('--reply-id <cid>', '被回复评论 cid')
-    .option('--at-uid <uid>', '@用户 uid')
-    .option('--at-sec-uid <sec_uid>', '@用户 sec_uid')
-    .option('--ticket-guard-client-data <v>', 'bd-ticket-guard-client-data 头值')
-    .option('--ticket-guard-ree-public-key <v>', 'bd-ticket-guard-ree-public-key 头值')
-    .option('--tt-session-dtrait <v>', 'x-tt-session-dtrait 头值')
-    .action(async (opts: {
-      awemeId: string;
-      text: string;
-      replyId?: string;
-      atUid?: string;
-      atSecUid?: string;
-      ticketGuardClientData?: string;
-      ticketGuardReePublicKey?: string;
-      ttSessionDtrait?: string;
-    }) => {
-      await run(async ({ env, session }) => {
-        let ticketGuard: TicketGuardHeaders;
-        if (opts.ticketGuardClientData && opts.ticketGuardReePublicKey && opts.ttSessionDtrait) {
-          ticketGuard = {
-            clientData: opts.ticketGuardClientData,
-            reePublicKey: opts.ticketGuardReePublicKey,
-            sessionDtrait: opts.ttSessionDtrait,
-          };
-          log.info('comment: 使用 CLI 手动指定的 ticket-guard 三头');
-        } else {
-          let cfg = await loadOrExtractTicketGuard(false);
-          if (!cfg) {
-            log.info('comment: 未找到 ticket-guard 配置，自动获取...');
-            const statePath = await getStatePathForBrowser();
-            const autoCfg = await autoExtractTicketGuard(statePath, { headless: true });
-            if (autoCfg) {
-              await saveTicketGuard(autoCfg);
-              cfg = autoCfg;
-            } else {
-              log.error('comment: 自动获取三头失败');
-              return;
-            }
-          }
-          if (isTicketGuardExpired(cfg)) {
-            log.warn(`comment: ticket-guard 可能已过期`);
-          }
-          ticketGuard = {
-            clientData: cfg.clientData,
-            reePublicKey: cfg.reePublicKey,
-            sessionDtrait: cfg.sessionDtrait,
-          };
-        }
-        let textExtra: Array<{ user_id: string; sec_uid: string; type: number; start: number; end: number }> = [];
-        if (opts.atUid && opts.atSecUid) {
-          const uids = opts.atUid.split(',').map((s) => s.trim()).filter(Boolean);
-          const secUids = opts.atSecUid.split(',').map((s) => s.trim()).filter(Boolean);
-          let searchStart = 0;
-          for (let i = 0; i < uids.length; i++) {
-            const atText = `@${i + 1}`;
-            const idx = opts.text.indexOf(atText, searchStart);
-            const start = idx >= 0 ? idx : 0;
-            const end = idx >= 0 ? idx + atText.length : 0;
-            textExtra.push({ user_id: uids[i], sec_uid: secUids[i], type: 0, start, end });
-            if (idx >= 0) searchStart = end;
-          }
-        }
-        const result = await publishComment(env, {
-          awemeId: opts.awemeId,
-          text: opts.text,
-          replyId: opts.replyId,
-          textExtra,
-        }, ticketGuard);
-        if (!result.success) {
-          log.error(`评论发布失败`);
-          return;
-        }
-        catBox('评论发布成功');
-        log.info(`  cid: ${C.gray}${result.commentId}${C.reset}`);
+    .option('--reply-id <cid>', '被回复评论 cid，0 表示顶级评论')
+    .option('--at-uid <uid>', '@用户 uid（多个用逗号分隔，正文使用 @1、@2 占位符）')
+    .option('--at-sec-uid <sec_uid>', '@用户 sec_uid（与 uid 一一对应）')
+    .option('--ticket-guard-client-data <v>', '手动 bd-ticket-guard-client-data（须同时提供三头）')
+    .option('--ticket-guard-ree-public-key <v>', '手动 bd-ticket-guard-ree-public-key')
+    .option('--tt-session-dtrait <v>', '手动 x-tt-session-dtrait')
+    .action(async (opts: CommentCommandOptions) => {
+      await run(async ({ env }) => {
+        await executeCommentCommand(opts, { env, json: cliState.json, getStatePath: getStatePathForBrowser });
       });
     });
 }
