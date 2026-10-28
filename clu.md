@@ -151,7 +151,7 @@ npx tsx src/indexv2.ts --account other
 
 启动浏览器扫码登录抖音，保存为指定账号并自动设为当前账号。
 
-登录成功后会**自动获取 ticket-guard 三头**（评论发布必需的浏览器加密签名头），无需单独运行 `ticket-guard` 命令。
+扫码登录成功后立即保存登录态。`comment` 会在当前账号的浏览器会话内自行生成签名并提交，无需在登录阶段配置三头。
 
 ```bash
 sprr login <name> [--timeout <ms>] [--url <url>]
@@ -821,7 +821,7 @@ sprr comments --aweme-id <id> [--cursor <n>] [--count <n>] [--max <n>] \
 
 ### `comment` - 发布评论/回复
 
-发布顶级评论或回复指定评论。**ticket-guard 三头会自动从 `data/ticket-guard.json` 加载**，无需每次手动传入。
+发布顶级评论或回复指定评论。默认启动无头浏览器，加载当前账号（或 `--state` / `--cookie` 指定）的登录态，在同一浏览器会话内生成签名并提交。无需先运行 `ticket-guard`，也不再复用全账号共享的签名缓存。
 
 ```bash
 sprr comment --aweme-id <id> --text <content> \
@@ -832,29 +832,27 @@ sprr comment --aweme-id <id> --text <content> \
 | 选项 | 必填 | 说明 |
 |------|------|------|
 | `--aweme-id` | 是 | 目标视频 aweme_id |
-| `--text` | 是 | 评论内容 |
-| `--reply-id` | 否 | 被回复评论 cid，不传则发布顶级评论 |
+| `--text` | 是 | 非空评论内容；使用 @ 功能时按顺序写入 `@1`、`@2` 占位符 |
+| `--reply-id` | 否 | 被回复评论 cid，不传或传 `0` 则发布顶级评论 |
 | `--at-uid` | 否 | @用户 uid，多个用逗号分隔 |
 | `--at-sec-uid` | 否 | @用户 sec_uid，与 `--at-uid` 一一对应，逗号分隔 |
-| `--ticket-guard-client-data` | 否 | 手动指定 `bd-ticket-guard-client-data` 头值（优先于配置文件） |
+| `--ticket-guard-client-data` | 否 | 手动指定 `bd-ticket-guard-client-data`，须与另外两头同时提供，使用 API 提交 |
 | `--ticket-guard-ree-public-key` | 否 | 手动指定 `bd-ticket-guard-ree-public-key` 头值 |
 | `--tt-session-dtrait` | 否 | 手动指定 `x-tt-session-dtrait` 头值 |
 
-> 重要说明：评论发布接口强制校验 `bd-ticket-guard-*` 和 `x-tt-session-dtrait` 三个头。这三个头由浏览器 secsdk（webmssdk.es5.js，VM 字节码保护）生成。**`sprr login` 登录时会自动获取这三个头**并保存到 `data/ticket-guard.json`，后续 `comment` 命令自动加载。三头在同一会话内稳定可复用，会话失效（cookie 过期）后重新登录或运行 `ticket-guard --auto` 刷新即可。
+> 评论签名与登录会话相关。默认流程让签名、Cookie 和请求始终处于同一浏览器上下文；手动提供三头时，请确保它们与当前 Cookie 匹配。只提供部分手动头会直接报错。
 
-**三头加载优先级：**
+`--at-uid` 与 `--at-sec-uid` 必须成对提供且数量一致，正文中的 `@1`、`@2` 必须按顺序存在。参数校验失败时不会启动浏览器或提交评论。
 
-1. CLI 手动指定的 `--ticket-guard-client-data` / `--ticket-guard-ree-public-key` / `--tt-session-dtrait`（三者必须同时提供）
-2. `data/ticket-guard.json` 中已保存的配置（由 `login` 或 `ticket-guard --auto` 生成）
-3. 首次运行 `comment` 时若配置文件不存在，会自动启动无头浏览器获取三头（等同于运行 `ticket-guard --auto`），获取成功后保存到配置文件供后续复用
+失败结果会包含原因，并在可用时提供 HTTP 状态和业务状态码；`--json` 同样支持成功和失败结果。空响应、断网等导致结果未知时，请先查看评论区确认是否已发出，再决定是否重试，程序不会自动重发。
 
 ---
 
 ### `ticket-guard` - 管理浏览器加密签名头
 
-管理评论发布所需的 `bd-ticket-guard-client-data` / `bd-ticket-guard-ree-public-key` / `x-tt-session-dtrait` 三个浏览器加密签名头。配置保存在 `data/ticket-guard.json`，由 `comment` 命令自动加载。
+管理 `bd-ticket-guard-client-data` / `bd-ticket-guard-ree-public-key` / `x-tt-session-dtrait` 三个浏览器加密签名头，配置保存在 `data/ticket-guard.json`，供调试和手动 API 调用使用。默认 `comment` 不读取这个缓存。
 
-**正常使用无需手动运行此命令** —— `sprr login` 登录时会自动获取三头。本命令仅用于以下场景：
+**正常评论无需手动运行此命令**。本命令仅用于以下调试场景：
 - 三头过期后刷新（默认 24 小时有效期）
 - 登录时自动获取失败后重试
 - 调试或查看当前配置
@@ -887,11 +885,11 @@ sprr ticket-guard --show
 **何时需要重新获取三头：**
 
 - `ticket-guard --show` 提示「可能已过期」（默认 24 小时有效期）
-- `comment` 命令返回风控码或空响应
+- 使用手动三头的 API 请求返回鉴权错误（默认浏览器评论不依赖此缓存）
 - 重新登录账号后（cookie 变化导致会话失效）
 - 切换到不同账号时
 
-> `comment` 命令在缺失三头时会自动触发浏览器获取流程，无需用户手动运行 `ticket-guard --auto`。
+> 默认 `comment` 在同一浏览器会话内完成签名和提交，无需用户手动运行 `ticket-guard --auto`；此命令生成的缓存不会自动用于评论。
 
 ---
 
@@ -1149,39 +1147,19 @@ aweme_id 超过 JavaScript 的 `Number.MAX_SAFE_INTEGER`，处理时必须用字
 
 **解决：** 命令执行间隔不要太短，频繁调用会触发风控。AI 自动回复已内置 5 秒节流（同一会话 5 秒内只查询一次 history），避免触发风控。
 
-### 6. 评论发布失败（ticket-guard 头无效或缺失）
+### 6. 评论发布失败
 
-**症状：** `comment` 命令报「缺少 ticket-guard 三头」，或返回 HTTP 200 但 status_code 非 0、空 body。
+默认评论在当前账号的浏览器会话内完成签名和提交，不读取 `data/ticket-guard.json`。使用 `--verbose --json` 查看返回的 `reason`、`statusCode`、`httpStatus` 和 `outcome`。
 
-**排查：**
-
-```
-# 1. 查看当前 ticket-guard 配置状态
-◆ sprr> ticket-guard --show
-# 若提示「当前无已保存的配置」或「可能已过期」，执行下面任一步骤
-
-# 2. 方式 A：无头浏览器自动获取（推荐，仅需已登录的 cookie）
-◆ sprr> ticket-guard --auto
-
-# 3. 方式 B：从已有抓包数据提取（开发者模式，需要抓包样本）
-◆ sprr> ticket-guard --from-capture
-
-# 4. 方式 C：手动从浏览器 DevTools 复制三头后导入
-#    在浏览器中发布一条评论 → F12 Network → 找到 comment/publish 请求
-#    复制 bd-ticket-guard-client-data / bd-ticket-guard-ree-public-key / x-tt-session-dtrait 三个头
-◆ sprr> ticket-guard \
-  --client-data "eyJ0c19zaWdu..." \
-  --ree-public-key "BHmVOc8Zj1..." \
-  --session-dtrait "d0_jSbZQNXVp..."
-
-# 5. 验证 comment 是否恢复正常
-◆ sprr> --verbose
-◆ sprr> comment --aweme-id 7400000000000000000 --text "测试"
-```
+- 参数错误：确认视频 ID、回复 ID 为数字，正文非空，@ 参数和占位符一一对应。
+- 登录态失效：用 `whoami` 核对当前账号，必要时重新 `login <name> --oc`。
+- 签名初始化失败：检查网络和 Playwright 是否可用，再执行命令。
+- `outcome: "unknown"`：请求可能已被服务端接受，请先检查评论区，避免重复发布。
+- 手动三头模式：三个头必须同时传入，并与当前 Cookie 属于同一会话；可省略三个头恢复默认浏览器模式。
 
 ### 7. playwright 缺失
 
-**症状：** `login`、`watch --ws` 或 `comment` 首次自动获取三头时报 `Cannot find module 'playwright'` 或 `Cannot find package 'playwright'`。
+**症状：** `login`、`watch --ws` 或 `comment` 启动浏览器时报 `Cannot find module 'playwright'` 或 `Cannot find package 'playwright'`。
 
 **解决：**
 
@@ -1359,12 +1337,7 @@ npx tsx src/indexv2.ts
 ◆ sprr> comments --aweme-id 7400000000000000000 --max 50
 # 从 JSON 中找到 cid == 7400000000000000000 的评论
 
-# 5. 首次发布评论前，确保 ticket-guard 三头已就绪（已配置过可跳过）
-◆ sprr> ticket-guard --show
-# 若无配置或已过期，自动获取（仅需已登录的 cookie）：
-◆ sprr> ticket-guard --auto
-
-# 6. 回复该评论（三头自动从 data/ticket-guard.json 加载；首次缺失时会自动触发 --auto）
+# 5. 回复该评论（自动使用当前账号浏览器会话内的签名与 Cookie）
 ◆ sprr> comment \
   --aweme-id 7400000000000000000 \
   --text "感谢提及" \

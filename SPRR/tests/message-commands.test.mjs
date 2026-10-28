@@ -124,6 +124,7 @@ function fixture(options = {}) {
     '../api/tos.js': { uploadImage: async () => { throw new Error('unexpected upload'); } },
     '../crypto/ticket-guard.js': {},
     './ticket-guard-auto.js': {},
+    './browser-comment.js': {},
     './capture-send.js': { captureSendRequests: async () => { throw new Error('unexpected capture'); } },
     './browser-send.js': {
       sendViaBrowser: async (...args) => { calls.browser.push(args); return result; },
