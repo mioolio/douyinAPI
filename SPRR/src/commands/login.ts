@@ -3,9 +3,9 @@
  *
  * 流程：
  *   1. 启动 headful 浏览器
- *   2. 若已有同名账号则加载旧 storageState（保留上次登录态，可能直接是已登录状态）
- *   3. 打开抖音聊天页，等待用户扫码登录
- *   4. 监测 URL 出现 chat 页 + 关键 cookie（sessionid）出现即视为登录成功
+ *   2. 默认先验证旧 storageState；--oc 使用全新的浏览器登录态
+ *   3. 打开抖音登录页，等待用户扫码登录
+ *   4. 监测抖音页面与新 sessionid cookie，确认登录完成
  *   5. 导出 storageState 保存到 data/accounts/<name>.json
  *   6. 自动设置为当前账号
  *
@@ -16,10 +16,8 @@
 
 import { chromium, request, type APIRequestContext } from 'playwright';
 import fs from 'node:fs/promises';
-import { accountFile, saveAccountStorageState, setCurrentAccount } from '../auth/accounts.js';
+import { accountFile, saveAccountStorageState, setCurrentAccount, validateAccountName } from '../auth/accounts.js';
 import { createLogger } from '../utils/logger.js';
-import { extractTicketGuardFromPage } from './ticket-guard-auto.js';
-import { saveTicketGuard } from '../crypto/ticket-guard.js';
 import { IMAPI_CONSTANTS, buildRequest, parseResponse, DEFAULT_UA, type RequestEnv } from '../api/imapi.js';
 import { encodeVarintField, encodeBytesField } from '../crypto/protobuf.js';
 import { readImapiResponseBody } from '../api/operations.js';
@@ -27,9 +25,20 @@ import { probeSession, type SessionValidation } from './session-validation.js';
 
 const log = createLogger('login');
 
-/** 检查 storageState 中是否包含 sessionid cookie（判断登录态） */
-function hasSessionid(state: { cookies?: Array<{ name: string; value: string }> }): boolean {
-  return Boolean(state.cookies?.some((c) => c.name === 'sessionid' && c.value));
+function isDouyinDomain(domain: string): boolean {
+  return domain === 'douyin.com' || domain.endsWith('.douyin.com');
+}
+
+/** 只接受抖音域名下的两种登录 Cookie。 */
+function getSessionids(state: { cookies?: Array<{ name: string; value: string; domain?: string }> }): string[] {
+  return (state.cookies || [])
+    .filter((cookie) => (cookie.name === 'sessionid' || cookie.name === 'sessionid_ss') &&
+      cookie.value && isDouyinDomain(cookie.domain || ''))
+    .map((cookie) => cookie.value);
+}
+
+function hasSessionid(state: Parameters<typeof getSessionids>[0]): boolean {
+  return getSessionids(state).length > 0;
 }
 
 /**
@@ -49,6 +58,7 @@ export async function loginAccount(
   name: string,
   options: { headless?: boolean; timeout?: number; url?: string; oc?: boolean } = {},
 ): Promise<void> {
+  validateAccountName(name);
   const headless = options.headless ?? false;
   const timeout = options.timeout ?? 5 * 60 * 1000;
   const loginUrl = options.url ?? 'https://www.douyin.com/';
@@ -59,26 +69,24 @@ export async function loginAccount(
     log.warn('headless 模式下无法扫码，仅用于复用已有 storageState 测试');
   }
 
-  // 已有同名账号：加载旧 storageState 作为初始状态
+  // --oc 使用干净的浏览器会话，旧账号文件保留到新登录成功后再覆盖。
   let existingState: string | undefined;
   let initialSessionids: Set<string> = new Set();
-  let oldStateObj: { cookies?: Array<{ name: string; value: string }> } | null = null;
-  try {
-    await fs.access(accountFile(name));
-    existingState = accountFile(name);
-    log.info(`检测到已有账号 ${name}，加载旧 storageState（如果是已登录状态可直接使用）`);
+  let oldStateObj: Parameters<typeof getSessionids>[0] | null = null;
+  if (!forceReLogin) {
     try {
-      oldStateObj = JSON.parse(await fs.readFile(accountFile(name), 'utf-8'));
-      initialSessionids = new Set(
-        (oldStateObj?.cookies || [])
-          .filter((c) => c.name === 'sessionid' || c.name === 'sessionid_ss')
-          .map((c) => c.value),
-      );
+      await fs.access(accountFile(name));
+      existingState = accountFile(name);
+      log.info(`检测到已有账号 ${name}，加载旧 storageState（如果是已登录状态可直接使用）`);
+      try {
+        oldStateObj = JSON.parse(await fs.readFile(accountFile(name), 'utf-8'));
+        initialSessionids = new Set(getSessionids(oldStateObj || {}));
+      } catch {
+        // 解析失败忽略
+      }
     } catch {
-      // 解析失败忽略
+      // 无旧账号
     }
-  } catch {
-    // 无旧账号
   }
 
   // 已有 sessionid 时只做轻量 IM 验证，不启动 Chromium。
@@ -101,6 +109,8 @@ export async function loginAccount(
       return;
     } else if (result.status === 'invalid') {
       log.warn('✗ 上次登录态已失效，需要重新扫码登录');
+      existingState = undefined;
+      initialSessionids.clear();
     } else {
       throw new Error(`暂时无法验证登录态：${result.reason}。原登录信息已保留，请稍后重试`);
     }
@@ -109,11 +119,12 @@ export async function loginAccount(
   // 打开有头浏览器扫码登录
   const browser = await chromium.launch({
     headless,
+    // Playwright 默认关闭 Chromium 弹窗拦截；扫码时恢复拦截，避免空白标签抢占窗口。
+    ignoreDefaultArgs: ['--disable-popup-blocking'],
     args: [
       '--disable-blink-features=AutomationControlled',
       '--no-sandbox',
       '--disable-dev-shm-usage',
-      '--disable-popup-blocking',
       '--window-size=1400,900',
     ],
   });
@@ -148,16 +159,16 @@ export async function loginAccount(
     let oldSessionNoticeShown = false;
     while (Date.now() - startTime < timeout) {
       try {
-        const state = await context.storageState();
-        const currentSessionids = (state.cookies || [])
-          .filter((c) => c.name === 'sessionid' || c.name === 'sessionid_ss')
-          .map((c) => c.value);
+        // storageState() 会为非当前 origin 创建、关闭临时标签页，不能用于轮询。
+        // 等待扫码只读取 Cookie；完整状态留到登录成功后导出一次。
+        const state = { cookies: await context.cookies() };
+        const currentSessionids = getSessionids(state);
         // 必须存在至少一个**新** sessionid（不在初始集合中）
         const hasNewSessionid = currentSessionids.some((v) => v && !initialSessionids.has(v));
         if (hasSessionid(state) && hasNewSessionid) {
           // 进一步确认 URL 在 douyin.com 域下（避免登录跳转中途保存）
-          const url = page.url();
-          if (url.includes('douyin.com')) {
+          const hostname = new URL(page.url()).hostname;
+          if (isDouyinDomain(hostname)) {
             loggedIn = true;
             log.info('检测到新 sessionid，登录成功！');
             break;
@@ -179,27 +190,7 @@ export async function loginAccount(
       throw new Error('登录超时，未检测到 sessionid cookie');
     }
 
-    // 复用当前浏览器会话自动获取 ticket-guard 三头（评论发布必需）
-    // 浏览器已打开且有登录态，导航到视频页触发 secsdk 初始化即可
-    try {
-      log.info('登录成功，正在自动获取 ticket-guard 三头（评论发布必需，约 10 秒）...');
-      const tgConfig = await extractTicketGuardFromPage(page);
-      if (tgConfig) {
-        await saveTicketGuard(tgConfig);
-        log.info(
-          `ticket-guard 三头已自动获取并保存（clientData=${tgConfig.clientData.length}chars, dtrait=${tgConfig.sessionDtrait.length}chars）`,
-        );
-        log.info('评论功能已就绪，可直接使用 sprr comment 命令');
-      } else {
-        log.warn('ticket-guard 自动获取失败，评论功能暂不可用');
-        log.warn('可手动运行 `sprr ticket-guard --auto` 重新获取（无需重新登录）');
-      }
-    } catch (e) {
-      log.warn('ticket-guard 自动获取异常（不影响登录结果）:', e);
-      log.warn('可手动运行 `sprr ticket-guard --auto` 重新获取');
-    }
-
-    // ticket-guard 初始化也可能更新 cookie，必须最后再导出。
+    // 登录完成立即保存；comment 会在自己的浏览器会话中初始化签名。
     const finalState = await context.storageState();
     await saveAccountStorageState(name, finalState);
 

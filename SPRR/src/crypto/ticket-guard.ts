@@ -9,11 +9,12 @@
  *   - x-tt-session-dtrait 会话级稳定，不随请求变化。
  *
  * 因此无需纯算逆向 ECDH + HMAC，只需从浏览器抓包一次，存入 data/ticket-guard.json，
- * 后续 comment 命令自动加载复用。会话失效（cookie 过期或风控）后重新抓包即可。
+ * 缓存供调试和手动 API 调用；默认 comment 在同一浏览器会话内获取签名后提交。
  */
 
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import { createHash } from 'node:crypto';
 import { createLogger } from '../utils/logger.js';
 import { DATA_DIR } from '../config/paths.js';
 
@@ -37,6 +38,32 @@ export interface TicketGuardConfig {
   capturedAt: number;
   /** 来源描述（如 "capture:0075_POST_xxx" 或 "manual"） */
   capturedFrom: string;
+  /** 绑定登录会话的摘要，不保存原始 Cookie。旧配置没有此字段时不可跨会话复用。 */
+  sessionFingerprint?: string;
+}
+
+/** 仅使用稳定登录 Cookie，避免 msToken 和 SDK Cookie 旋转导致会话误失配。 */
+export function ticketGuardSessionFingerprint(cookie: string): string {
+  const values = new Map<string, string>();
+  for (const part of cookie.split(';')) {
+    const idx = part.indexOf('=');
+    if (idx <= 0) continue;
+    const name = part.slice(0, idx).trim();
+    const value = part.slice(idx + 1).trim();
+    if (name && value) values.set(name, value);
+  }
+  const authNames = ['sessionid', 'sessionid_ss', 'sid_tt', 'uid_tt'];
+  const auth = authNames.filter((name) => values.has(name));
+  const names = auth.length ? auth : [...values.keys()].sort();
+  if (names.length === 0) return '';
+  return createHash('sha256')
+    .update(JSON.stringify(names.map((name) => [name, values.get(name)])))
+    .digest('hex');
+}
+
+export function isTicketGuardForSession(cfg: TicketGuardConfig, cookie: string): boolean {
+  const fingerprint = ticketGuardSessionFingerprint(cookie);
+  return Boolean(fingerprint && cfg.sessionFingerprint === fingerprint);
 }
 
 /**
@@ -61,9 +88,13 @@ export async function loadTicketGuard(): Promise<TicketGuardConfig | null> {
 /**
  * 保存 ticket-guard 配置到 data/ticket-guard.json
  */
-export async function saveTicketGuard(cfg: TicketGuardConfig): Promise<void> {
+export async function saveTicketGuard(cfg: TicketGuardConfig, cookie?: string): Promise<void> {
+  const config = cookie === undefined ? cfg : {
+    ...cfg,
+    sessionFingerprint: ticketGuardSessionFingerprint(cookie),
+  };
   await fs.mkdir(DATA_DIR, { recursive: true });
-  await fs.writeFile(TICKET_GUARD_FILE, JSON.stringify(cfg, null, 2), 'utf-8');
+  await fs.writeFile(TICKET_GUARD_FILE, JSON.stringify(config, null, 2), 'utf-8');
   log.info(`saveTicketGuard: 已保存到 ${TICKET_GUARD_FILE}`);
 }
 
@@ -124,6 +155,7 @@ export async function extractTicketGuardFromCapture(
           sessionDtrait,
           capturedAt,
           capturedFrom: `capture:${file}`,
+          sessionFingerprint: ticketGuardSessionFingerprint(headers.cookie || ''),
         };
       }
       log.debug(`extractTicketGuardFromCapture: ${file} 缺少完整三头，尝试下一个`);
@@ -150,8 +182,11 @@ export function isTicketGuardExpired(
   cfg: TicketGuardConfig,
   maxAgeMs: number = 24 * 60 * 60 * 1000,
 ): boolean {
+  if (typeof cfg.capturedAt !== 'number' || !Number.isFinite(cfg.capturedAt) || cfg.capturedAt <= 0) {
+    return true;
+  }
   const age = Date.now() - cfg.capturedAt;
-  return age > maxAgeMs;
+  return age < 0 || age > maxAgeMs;
 }
 
 /**

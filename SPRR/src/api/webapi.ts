@@ -1085,8 +1085,155 @@ export async function getCommentList(
   }
 }
 
+export interface PublishCommentOptions {
+  awemeId: string;
+  text: string;
+  /** 不传、空字符串或 '0' 表示顶级评论。 */
+  replyId?: string;
+  textExtra?: Array<{ user_id: string; sec_uid: string; type: number; start: number; end: number }>;
+}
+
+export interface PublishCommentResult {
+  success: boolean;
+  commentId?: string;
+  reason?: string;
+  statusCode?: number;
+  httpStatus?: number;
+  /** unknown 表示请求可能已提交，不应自动重发。 */
+  outcome?: 'rejected' | 'unknown';
+  /** 平台风控要求二次身份验证时的场景、原因与可选方式（x-tt-verify-passport-decision）。 */
+  verify?: { scene?: string; reason?: string; ways?: string[] };
+  raw?: unknown;
+}
+
+export function validateCommentOptions(opts: PublishCommentOptions): string | undefined {
+  if (!/^[1-9]\d*$/.test(opts.awemeId)) return 'aweme_id 必须为非零数字 ID';
+  if (!opts.text.trim()) return '评论内容不能为空';
+  if (opts.replyId?.trim() && !/^\d+$/.test(opts.replyId.trim())) return 'reply_id 必须为数字 ID';
+  for (const extra of opts.textExtra ?? []) {
+    if (!extra.user_id || !extra.sec_uid || !Number.isInteger(extra.start) || !Number.isInteger(extra.end)
+      || extra.start < 0 || extra.end <= extra.start || extra.end > opts.text.length) {
+      return '@用户元数据或文字范围无效';
+    }
+  }
+}
+
+/** Node 与浏览器发送同一份表单，避免正文签名和实际发送内容不同。 */
+export function buildCommentPublishBody(opts: PublishCommentOptions): string {
+  const replyId = opts.replyId?.trim();
+  const isReply = Boolean(replyId && replyId !== '0');
+  const form: Record<string, string> = {
+    aweme_id: opts.awemeId,
+    comment_send_celltime: String(Math.floor(Math.random() * 30000) + 5000),
+    comment_video_celltime: String(Math.floor(Math.random() * 10000) + 1000),
+    one_level_comment_rank: isReply ? '1' : '-1',
+    paste_edit_method: 'non_paste',
+    text: opts.text,
+    text_extra: JSON.stringify(opts.textExtra ?? []),
+  };
+  if (isReply) form.reply_id = replyId!;
+  return Object.entries(form).map(([key, value]) => `${key}=${encodeURIComponent(value)}`).join('&');
+}
+
 /**
- * 发布评论或回复评论（/aweme/v1/web/comment/publish）
+ * 解析 x-tt-verify-passport-decision 响应头（抓包 debug-comment-20261028-150850/001）：
+ * 风控质询时 publish 返回 HTTP 200 + 空响应体，真实语义在该头里，此时评论未发布。
+ */
+export function parseVerifyDecisionHeader(
+  header: string | undefined | null,
+): PublishCommentResult['verify'] | undefined {
+  if (!header?.trim()) return undefined;
+  try {
+    const j = JSON.parse(header) as {
+      event_params?: { verify_scene?: string; verify_reason?: string };
+      verify_way_name_list?: string;
+    };
+    return {
+      scene: j.event_params?.verify_scene,
+      reason: j.event_params?.verify_reason,
+      ways: j.verify_way_name_list?.split(',').map((s) => s.trim()).filter(Boolean),
+    };
+  } catch {
+    return { reason: 'unparseable' };
+  }
+}
+
+function verifyRejectedResult(
+  httpStatus: number,
+  verify: NonNullable<PublishCommentResult['verify']>,
+  rawText: string,
+): PublishCommentResult {
+  const ways = verify.ways?.length ? `，可选 ${verify.ways.join(' / ')}` : '';
+  return {
+    success: false, httpStatus, outcome: 'rejected', verify, raw: rawText.slice(0, 2000),
+    reason: `平台风控要求先完成身份验证（scene=${verify.scene || '?'} reason=${verify.reason || '?'}${ways}），评论未发布；请在已登录浏览器完成验证后重试`,
+  };
+}
+
+/** 显式拒绝与无法确认的发布结果分别报告；只有真实 cid 才表示成功。 */
+export function parseCommentPublishResponse(
+  httpStatus: number, rawText: string, verifyDecisionHeader?: string | null,
+): PublishCommentResult {
+  let raw: unknown;
+  try {
+    raw = JSON.parse(rawText);
+  } catch {
+    const verify = parseVerifyDecisionHeader(verifyDecisionHeader);
+    if (verify) return verifyRejectedResult(httpStatus, verify, rawText);
+    return {
+      success: false, httpStatus, outcome: 'unknown',
+      reason: `HTTP ${httpStatus}；${rawText.trim() ? '响应不是有效 JSON' : '响应为空'}，无法确认评论是否已发布`,
+      raw: rawText.slice(0, 2000),
+    };
+  }
+  const data = raw && typeof raw === 'object' && !Array.isArray(raw)
+    ? raw as { status_code?: unknown; status_msg?: unknown; message?: unknown; comment?: { cid?: unknown } }
+    : undefined;
+  const statusCode = typeof data?.status_code === 'number' ? data.status_code : undefined;
+  const message = [data?.status_msg, data?.message].find((value) => typeof value === 'string' && value.trim());
+  if (statusCode !== undefined && statusCode !== 0) {
+    return {
+      success: false, statusCode, httpStatus, outcome: 'rejected', raw,
+      reason: `${message || '平台拒绝发布评论'} (status_code=${statusCode}, HTTP ${httpStatus})`,
+    };
+  }
+  const cid = data?.comment?.cid;
+  const commentId = typeof cid === 'string' ? cid : Number.isSafeInteger(cid) ? String(cid) : '';
+  if (httpStatus >= 200 && httpStatus < 300 && statusCode === 0 && /^[1-9]\d*$/.test(commentId)) {
+    return { success: true, commentId, statusCode, httpStatus, raw };
+  }
+  return {
+    success: false, statusCode, httpStatus, outcome: 'unknown', raw,
+    reason: `HTTP ${httpStatus}；${message || '响应缺少有效评论 ID'}，无法确认评论是否已发布`,
+  };
+}
+
+export function buildCommentPublishParams(
+  env: { cookie: string; identitySecurityDeviceId?: string },
+): Record<string, string> {
+  const msToken = extractMsToken(env.cookie);
+  const verifyFp = parseCookieValue(env.cookie, 's_v_web_id') || '';
+  const params: Record<string, string> = {
+    app_name: 'aweme', enter_from: 'recommend', previous_page: 'recommend',
+    device_platform: 'webapp', aid: '6383', channel: 'channel_pc_web',
+    pc_client_type: '1', pc_libra_divert: 'Windows', update_version_code: '170400',
+    support_h265: '1', support_dash: '1', version_code: '170400', version_name: '17.4.0',
+    cookie_enabled: 'true', screen_width: '1400', screen_height: '900',
+    browser_language: 'zh-CN', browser_platform: 'Win32', browser_name: 'Chrome',
+    browser_version: '130.0.0.0', browser_online: 'true', engine_name: 'Blink',
+    engine_version: '130.0.0.0', os_name: 'Windows', os_version: '10',
+    cpu_core_num: '12', device_memory: '16', platform: 'PC',
+    downlink: '10', effective_type: '4g', round_trip_time: '150',
+    webid: env.identitySecurityDeviceId || '0',
+  };
+  if (msToken) params.msToken = msToken;
+  if (verifyFp) { params.verifyFp = verifyFp; params.fp = verifyFp; }
+  return params;
+}
+
+/**
+ * 使用显式签名头发布评论或回复评论（/aweme/v1/web/comment/publish）。
+ * 默认 CLI 流程在浏览器同一上下文内自动签名和提交。
  *
  * 抓包验证（0052_POST_4ee30eae99ab）：
  *   - POST /aweme/v1/web/comment/publish
@@ -1099,6 +1246,9 @@ export async function getCommentList(
  *      实际使用需从浏览器抓包复制，会话内稳定可复用）
  *   - 必需 cookie: x-secsdk-csrf-token: DOWNGRADE
  *   - 响应：status_code=0 + comment{cid,...} 表示成功
+ *   - 风控质询（debug-comment-20261028-150850/001）：HTTP 200 + 空响应体，
+ *     真实语义在 x-tt-verify-passport-decision 头（scene=comment），
+ *     完成二次验证后同一 body 重试即可成功（同抓包 /002）
  *
  * @param env 请求环境
  * @param opts 评论参数
@@ -1106,84 +1256,19 @@ export async function getCommentList(
  */
 export async function publishComment(
   env: RequestEnv,
-  opts: {
-    awemeId: string;
-    text: string;
-    /** 被回复评论 cid（回复顶级评论时传该评论 cid；发布顶级评论时不传或传 '0'） */
-    replyId?: string;
-    /** @用户元数据（text_extra 数组，每项含 user_id/sec_uid/type/start/end） */
-    textExtra?: Array<{
-      user_id: string;
-      sec_uid: string;
-      type: number;
-      start: number;
-      end: number;
-    }>;
-  },
+  opts: PublishCommentOptions,
   ticketGuard: TicketGuardHeaders,
-): Promise<{ success: boolean; commentId?: string; raw?: unknown }> {
+): Promise<PublishCommentResult> {
+  const invalid = validateCommentOptions(opts);
+  if (invalid) return { success: false, outcome: 'rejected', reason: invalid };
   if (!ticketGuard.clientData || !ticketGuard.reePublicKey || !ticketGuard.sessionDtrait) {
     log.error('publishComment: 缺少 ticket-guard 头（clientData/reePublicKey/sessionDtrait 必需，请从浏览器抓包复制）');
-    return { success: false };
+    return { success: false, outcome: 'rejected', reason: '缺少完整的 ticket-guard 签名头' };
   }
 
   const url = new URL('https://www.douyin.com/aweme/v1/web/comment/publish');
-  const msToken = extractMsToken(env.cookie);
-  const verifyFp = parseCookieValue(env.cookie, 's_v_web_id') || '';
-  const params: Record<string, string> = {
-    app_name: 'aweme',
-    enter_from: 'recommend',
-    previous_page: 'recommend',
-    device_platform: 'webapp',
-    aid: '6383',
-    channel: 'channel_pc_web',
-    pc_client_type: '1',
-    pc_libra_divert: 'Windows',
-    update_version_code: '170400',
-    support_h265: '1',
-    support_dash: '1',
-    version_code: '170400',
-    version_name: '17.4.0',
-    cookie_enabled: 'true',
-    screen_width: '1400',
-    screen_height: '900',
-    browser_language: 'zh-CN',
-    browser_platform: 'Win32',
-    browser_name: 'Chrome',
-    browser_version: '130.0.0.0',
-    browser_online: 'true',
-    engine_name: 'Blink',
-    engine_version: '130.0.0.0',
-    os_name: 'Windows',
-    os_version: '10',
-    cpu_core_num: '12',
-    device_memory: '16',
-    platform: 'PC',
-    downlink: '10',
-    effective_type: '4g',
-    round_trip_time: '150',
-    webid: env.identitySecurityDeviceId || '0',
-  };
-  if (msToken) params.msToken = msToken;
-  if (verifyFp) {
-    params.verifyFp = verifyFp;
-    params.fp = verifyFp;
-  }
-
-  // 构造表单 body
-  const formParams: Record<string, string> = {
-    aweme_id: opts.awemeId,
-    comment_send_celltime: String(Math.floor(Math.random() * 30000) + 5000),
-    comment_video_celltime: String(Math.floor(Math.random() * 10000) + 1000),
-    one_level_comment_rank: opts.replyId ? '1' : '-1',
-    paste_edit_method: 'non_paste',
-    text: opts.text,
-    text_extra: JSON.stringify(opts.textExtra || []),
-  };
-  if (opts.replyId) formParams.reply_id = opts.replyId;
-  const body = Object.entries(formParams)
-    .map(([k, v]) => `${k}=${encodeURIComponent(v)}`)
-    .join('&');
+  const params = buildCommentPublishParams(env);
+  const body = buildCommentPublishBody(opts);
 
   // 生成 a_bogus 签名（基于 params + body）
   const { aBogus } = signRequest({
@@ -1220,30 +1305,17 @@ export async function publishComment(
   log.info(`publishComment: awemeId=${opts.awemeId} replyId=${opts.replyId || '(top-level)'} text=${truncate(opts.text, 30)} aBogus=${aBogus ? aBogus.length + 'chars' : 'none'}`);
   try {
     const res = await fetch(url.toString(), { method: 'POST', headers, body });
-    if (!res.ok) {
-      log.error(`publishComment: HTTP ${res.status}`);
-      return { success: false };
-    }
     const rawText = await res.text();
     log.debug(`publishComment: response=${rawText.slice(0, 500)}`);
-    if (!rawText) {
-      // 抓包样本显示成功响应可能为空 body（content-length: 0）
-      log.warn('publishComment: 响应为空（可能是重复发布或被风控）');
-      return { success: false };
-    }
-    const j = JSON.parse(rawText) as {
-      status_code?: number;
-      comment?: { cid?: string };
-    };
-    if (j.status_code === 0 && j.comment?.cid) {
-      log.info(`publishComment: 成功 cid=${j.comment.cid}`);
-      return { success: true, commentId: j.comment.cid, raw: j };
-    }
-    log.warn(`publishComment: 失败 status_code=${j.status_code}`);
-    return { success: false, raw: j };
+    const result = parseCommentPublishResponse(
+      res.status, rawText, res.headers.get('x-tt-verify-passport-decision'),
+    );
+    if (result.success) log.info(`publishComment: 成功 cid=${result.commentId}`);
+    else log.warn(`publishComment: ${result.reason}`);
+    return result;
   } catch (e) {
     log.error(`publishComment 异常`, e);
-    return { success: false };
+    return { success: false, outcome: 'unknown', reason: `请求异常，无法确认评论是否已发布：${e instanceof Error ? e.message : String(e)}` };
   }
 }
 
