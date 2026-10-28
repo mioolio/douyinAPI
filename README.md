@@ -22,7 +22,7 @@
 
 ### 环境要求
 
-- Node.js >= 18
+- Node.js >= 24
 - pnpm 或 npm
 - Playwright Chromium（首次运行时自动下载）
 
